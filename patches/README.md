@@ -89,6 +89,25 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
 - 0128 (2026-11-05): new (dxcore: adapters from the GPUs Wine registers, with their name, PCI ids, LUID and driver
   version, instead of wined3d's identifier, which said "Intel(R) HD Graphics 4000" with a 2013 driver when wined3d had
   no GL; wined3d stays the fallback).
+- 0129 (2026-11-06): new (d2d1: outline lines shorter than 1e-4 units add no segment and no join; a closed figure's
+  too-short closing line takes the tangent from the segment before). Premiere's Save project dialog drew a full-height
+  line at each pill button's right edge: the buttons end their arcs 2e-6 off the side lines, and the backwards "line"
+  made a reversal join with a 25 unit extension. Repro tests/d2d/pill3.c.
+- 0130 (2026-11-06): new (d2d1: a WIC bitmap render target's texture is created with the bitmap's pixels). Premiere
+  draws each time ruler item with its own WIC render target on one bitmap; each started empty and wrote all of it back,
+  so only the last item survived: one marker, one time number, no ticks (issue #28). Repro tests/d2d/wicrt.c.
+- 0131 (2026-11-06): replaced the same day (was win32u: ReleaseDC keeps another window's paint DC; relpaintdc.exe
+  on Windows 11 showed that Windows does release it). Now comctl32: themed buttons paint through a paint buffer, as on
+  Windows. Lightroom Classic's group boxes call ReleaseDC(groupbox, hdc) in WM_ERASEBKGND on the DC that a themed
+  child radio sends through DrawThemeParentBackground; Wine passed the radio's own paint DC, so "Edit Photo with Adobe
+  Photoshop" (Ctrl+E) showed no radio buttons. Windows 11 passes a memory DC owned by no window (ReleaseDC on it: 0).
+  repro tests/paint/radiodc.c: Windows 11 0 fails, Wine before 1, after 0; regress.sh 0 failures; lrc_ps_edit radios 3/3.
+- 0132 (2026-11-06): new (gdiplus: filling closes an open figure that another figure follows). The span code added
+  the closing edge only for explicitly closed figures or the path's last one, so an open figure followed by another
+  left an odd edge count and Wine stopped on assert(edge[0].y == edge[1].y) in region.c: Lightroom Classic's Photo >
+  Edit In > Open as Layers in Photoshop ended in "Assertion failed" and Adobe's error report. repro tests/gdiplus/openfig.c:
+  0 fails (assert before); Wine's gdiplus tests graphicspath 1195, region 6042, graphics 5913: 0 failures before and
+  after.
 - patches-deps/dxvk-3.1.1-intel-device-information-counter.patch (2026-11-05): DXVK's d3d11 offers Intel's
   "Intel Device Information" counter (Intel GPUDetect protocol: Version 2, Size 24, GPU generation from the PCI id) on
   Intel adapters. Premiere reads it and otherwise rejects Intel GPUs as "Hardware out of date". With 0127 and 0128,
