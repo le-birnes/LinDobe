@@ -1,0 +1,622 @@
+Subject: [PATCH] win32u: Compose opaque GDI children over per-pixel parents.
+
+Photoshop's Type Context Bar hosts standard Edit controls initialized with
+LWA_ALPHA=255 inside an UpdateLayeredWindow popup. Their buffers contain the
+font and size, but they inherit the parent's dummy GDI surface and empty clip.
+Removing WS_EX_LAYERED from the edits does not fix that inherited surface.
+
+Give these opaque layered children offscreen GDI caches when they have a
+per-pixel ancestor. Clip independently surfaced children against ancestor
+geometry instead of their parent's dummy surface. Mark affected ancestors so
+normal window trees keep their existing painting path, and refresh presentation
+when a control or its container moves, hides or is destroyed. Also initialize
+children when the parent's first per-pixel update follows their creation.
+
+Snapshot window metadata and referenced child caches before locking a drawing
+surface: window position updates take the user lock before the surface lock.
+No window-tree queries run while composing pixels. A scaled target defers its
+presentation callbacks to the outer surface after that surface is unlocked.
+
+Compose visible cached controls from back to front into a temporary copy at
+presentation time. Consume that copy once in the scaling path. On X11 use a
+temporary non-SHM XImage for these composed pixels: copying them into the shared
+XImage would overwrite the application's backing bitmap and leave stale controls
+behind after a move or hide. The application's per-pixel source stays intact.
+
+This supports opaque LWA_ALPHA-only child controls, not general semi-transparent
+or color-keyed child-window composition. Existing non-layered controls, ordinary
+parents and unsupported alpha modes keep their previous drawing paths. There
+are no application-class checks, preference changes or compositor rules.
+
+Reproducer: tests/layered/context-controls.c. Pixel checks cover nonempty text,
+text changes, parent updates, resizing, control/container movement and visibility,
+destruction, and concurrent GDI painting/control movement. Both creation orders pass under Xvfb and KWin/XWayland; a
+separate disposable-prefix Xvfb run also passes at 144 DPI. Photoshop's font,
+size editing and focus-switch workflow was confirmed in an isolated runtime.
+
+---
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -82,6 +82,7 @@
+ #define WIN_NEEDS_SHOW_OWNEDPOPUP 0x0020 /* WM_SHOWWINDOW:SC_SHOW must be sent in the next ShowOwnedPopup call */
+ #define WIN_CHILDREN_MOVED        0x0040 /* children may have moved, ignore stored positions */
+ #define WIN_HAS_IME_WIN           0x0080 /* the window has been registered with imm32 */
++#define WIN_LAYERED_CHILDREN      0x0100 /* descendant GDI surfaces require composition */
+ 
+ #define WND_OTHER_PROCESS ((WND *)1)  /* returned by get_win_ptr on unknown window handles */
+ #define WND_DESKTOP       ((WND *)2)  /* returned by get_win_ptr on the desktop window */
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -45,6 +45,8 @@
+ 
+ /* dce.c */
+ extern struct window_surface dummy_surface;
++extern void refresh_window_surface( HWND hwnd );
++extern void create_offscreen_window_surface( HWND hwnd, const RECT *surface_rect, struct window_surface **surface );
+ extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, struct ratio monitor_dpi,
+                                    struct window_surface **window_surface );
+ extern struct window_surface *get_driver_window_surface( struct window_surface *surface, struct ratio monitor_dpi );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2308,10 +2308,33 @@
+     return TRUE;
+ }
+ 
++static BOOL has_layered_children( HWND hwnd )
++{
++    WND *win = get_win_ptr( hwnd );
++    BOOL ret;
++
++    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
++    ret = !!(win->flags & WIN_LAYERED_CHILDREN);
++    release_win_ptr( win );
++    return ret;
++}
++
++static void mark_layered_ancestors( HWND hwnd )
++{
++    WND *win;
++
++    for (; hwnd && hwnd != NtUserGetDesktopWindow(); hwnd = NtUserGetAncestor( hwnd, GA_PARENT ))
++    {
++        if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) continue;
++        win->flags |= WIN_LAYERED_CHILDREN;
++        release_win_ptr( win );
++    }
++}
++
+ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
+                                                   struct window_rects *rects, RECT *surface_rect )
+ {
+-    BOOL shaped, needs_surface, create_opaque, is_layered, is_child;
++    BOOL shaped, needs_surface, create_opaque, is_layered, is_child, opaque_child = FALSE;
+     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+     struct window_surface *new_surface;
+     struct window_rects monitor_rects;
+@@ -2323,6 +2346,33 @@
+     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+     is_child = parent && parent != NtUserGetDesktopWindow();
++    if (is_child && (ex_style & WS_EX_LAYERED))
++    {
++        DWORD flags;
++        COLORREF key;
++        BYTE alpha;
++        opaque_child = NtUserGetLayeredWindowAttributes( hwnd, &key, &alpha, &flags ) &&
++                       flags == LWA_ALPHA && alpha == 255;
++        if (opaque_child)
++        {
++            HWND ancestor;
++            opaque_child = FALSE;
++            for (ancestor = parent; ancestor && ancestor != NtUserGetDesktopWindow();
++                 ancestor = NtUserGetAncestor( ancestor, GA_PARENT ))
++            {
++                WND *win = get_win_ptr( ancestor );
++                if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) continue;
++                if (win->surface)
++                {
++                    window_surface_lock( win->surface );
++                    opaque_child = !!win->surface->alpha_mask;
++                    window_surface_unlock( win->surface );
++                }
++                release_win_ptr( win );
++                if (opaque_child) break;
++            }
++        }
++    }
+ 
+     if (is_child) get_win_monitor_dpi( parent, &raw_dpi );
+     else monitor_dpi_from_rect( rects->window, get_thread_dpi(), &raw_dpi );
+@@ -2343,6 +2393,11 @@
+     if (!is_child) rects->visible = get_visible_rect( hwnd, shaped, style, ex_style, rects );
+     if (!get_surface_rect( &rects->visible, surface_rect )) needs_surface = FALSE;
+     if (!get_default_window_surface( hwnd, surface_rect, &new_surface )) return NULL;
++    if (is_child && !create_layered && !opaque_child && new_surface && !new_surface->alpha_mask)
++    {
++        window_surface_release( new_surface );
++        new_surface = NULL;
++    }
+ 
+     is_layered = new_surface && new_surface->alpha_mask;
+     create_opaque = !(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED);
+@@ -2357,7 +2412,12 @@
+     if (IsRectEmpty( surface_rect )) needs_surface = FALSE;
+     else if (create_layered || is_layered) needs_surface = TRUE;
+ 
+-    if (needs_surface)
++    if (opaque_child && !IsRectEmpty( surface_rect ))
++    {
++        create_offscreen_window_surface( hwnd, surface_rect, &new_surface );
++        if (new_surface) mark_layered_ancestors( parent );
++    }
++    else if (needs_surface)
+         create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, &new_surface );
+     else if (new_surface && new_surface != &dummy_surface)
+     {
+@@ -2593,6 +2653,9 @@
+         update_client_surfaces( toplevel );
+     }
+ 
++    if (ret && is_child && has_layered_children( toplevel ))
++        refresh_window_surface( NtUserGetAncestor( hwnd, GA_PARENT ) );
++
+     return ret;
+ }
+ 
+@@ -2809,6 +2872,30 @@
+     return ret;
+ }
+ 
++static void update_layered_children( HWND hwnd )
++{
++    HWND *children = list_window_children( hwnd );
++    unsigned int i;
++
++    if (!children) return;
++    for (i = 0; children[i]; i++)
++    {
++        COLORREF key;
++        DWORD flags;
++        BYTE alpha;
++
++        if ((NtUserGetWindowLongW( children[i], GWL_EXSTYLE ) & WS_EX_LAYERED) &&
++            NtUserGetLayeredWindowAttributes( children[i], &key, &alpha, &flags ) &&
++            flags == LWA_ALPHA && alpha == 255)
++        {
++            update_window_state( children[i] );
++            NtUserRedrawWindow( children[i], NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME );
++        }
++        update_layered_children( children[i] );
++    }
++    free( children );
++}
++
+ /*****************************************************************************
+  *           UpdateLayeredWindow (win32u.@)
+  */
+@@ -2882,6 +2969,7 @@
+         BLENDFUNCTION src_blend = { AC_SRC_OVER, 0, 255, 0 };
+         RECT rect = new_rects.window, src_rect;
+         HDC hdc = NULL;
++        BOOL had_alpha = !!surface->alpha_mask;
+ 
+         OffsetRect( &rect, -rect.left, -rect.top );
+         intersect_rect( &rect, &rect, &surface_rect );
+@@ -2907,6 +2995,7 @@
+ 
+         if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
+         window_surface_set_layered( surface, key, -1, 0xff000000 );
++        if (!had_alpha) update_layered_children( hwnd );
+ 
+         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );
+         window_surface_flush( surface );
+@@ -5646,7 +5735,11 @@
+ 
+     if (hwnd == get_capture()) user_driver->pSetCapture( NULL, 0, toplevel );
+ 
+-    if (toplevel && toplevel != hwnd) update_window_state( toplevel );
++    if (toplevel && toplevel != hwnd)
++    {
++        update_window_state( toplevel );
++        if (has_layered_children( toplevel )) refresh_window_surface( toplevel );
++    }
+ 
+     /* FIXME: do we need to fake QS_MOUSEMOVE wakebit? */
+ 
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -52,6 +52,10 @@
+ static struct list window_surfaces = LIST_INIT( window_surfaces );
+ static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++static void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info );
++static void flush_window_surface( struct window_surface *surface, BOOL compose );
++static void set_window_surface_shape( struct window_surface *surface, HRGN shape, BOOL flush );
++
+ /*******************************************************************
+  * Dummy window surface for windows that shouldn't get painted.
+  */
+@@ -117,7 +121,7 @@
+     .destroy = offscreen_window_surface_destroy
+ };
+ 
+-static void create_offscreen_window_surface( HWND hwnd, const RECT *surface_rect, struct window_surface **window_surface )
++void create_offscreen_window_surface( HWND hwnd, const RECT *surface_rect, struct window_surface **window_surface )
+ {
+     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     struct window_surface *previous;
+@@ -126,7 +130,8 @@
+     TRACE( "hwnd %p, surface_rect %s, window_surface %p.\n", hwnd, wine_dbgstr_rect( surface_rect ), window_surface );
+ 
+     /* check that old surface is an offscreen_window_surface, or release it */
+-    if ((previous = *window_surface) && previous->funcs == &offscreen_window_surface_funcs) return;
++    if ((previous = *window_surface) && previous->funcs == &offscreen_window_surface_funcs &&
++        EqualRect( &previous->rect, surface_rect )) return;
+ 
+     memset( info, 0, sizeof(*info) );
+     info->bmiHeader.biSize        = sizeof(info->bmiHeader);
+@@ -170,6 +175,18 @@
+     struct scaled_surface *surface = get_scaled_surface( window_surface );
+     RECT src = *dirty, dst;
+     HDC hdc_dst, hdc_src;
++    HBITMAP bitmap = window_surface->color_bitmap, temporary = 0;
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    void *bits;
++
++    if (color_bits != window_surface_get_color( window_surface, info ))
++    {
++        temporary = NtGdiCreateDIBSection( 0, NULL, 0, color_info, DIB_RGB_COLORS, 0, 0, 0, &bits );
++        if (!temporary) return FALSE;
++        memcpy( bits, color_bits, color_info->bmiHeader.biSizeImage );
++        bitmap = temporary;
++    }
+ 
+     src.left &= ~7;
+     src.top &= ~7;
+@@ -181,7 +198,7 @@
+     hdc_dst = NtGdiCreateCompatibleDC( 0 );
+     hdc_src = NtGdiCreateCompatibleDC( 0 );
+ 
+-    NtGdiSelectBitmap( hdc_src, window_surface->color_bitmap );
++    NtGdiSelectBitmap( hdc_src, bitmap );
+     NtGdiSelectBitmap( hdc_dst, surface->target_surface->color_bitmap );
+ 
+     /* FIXME: implement HALFTONE with alpha for layered surfaces */
+@@ -193,6 +210,7 @@
+ 
+     NtGdiDeleteObjectApp( hdc_dst );
+     NtGdiDeleteObjectApp( hdc_src );
++    if (temporary) NtGdiDeleteObjectApp( temporary );
+ 
+     window_surface_lock( surface->target_surface );
+     add_bounds_rect( &surface->target_surface->bounds, &dst );
+@@ -201,14 +219,14 @@
+     if (shape_changed)
+     {
+         HRGN hrgn = map_dpi_region( window_surface->shape_region, surface->dpi_from, surface->dpi_to );
+-        window_surface_set_shape( surface->target_surface, hrgn );
++        set_window_surface_shape( surface->target_surface, hrgn, FALSE );
+         if (hrgn) NtGdiDeleteObjectApp( hrgn );
+ 
+         window_surface_set_layered( surface->target_surface, window_surface->color_key,
+                                     window_surface->alpha_bits, window_surface->alpha_mask );
+     }
+ 
+-    window_surface_flush( surface->target_surface );
++    flush_window_surface( surface->target_surface, FALSE );
+     return TRUE;
+ }
+ 
+@@ -627,7 +645,138 @@
+     pthread_mutex_unlock( &surface->mutex );
+ }
+ 
+-void window_surface_flush( struct window_surface *surface )
++static BOOL is_composition_surface( struct window_surface *surface )
++{
++    WND *win = get_win_ptr( surface->hwnd );
++    BOOL ret;
++
++    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
++    ret = win->surface == surface && (win->flags & WIN_LAYERED_CHILDREN);
++    release_win_ptr( win );
++    return ret;
++}
++
++struct layered_child
++{
++    struct list entry;
++    struct window_surface *surface;
++    RECT rect;
++    RECT clip;
++};
++
++static void collect_layered_children( HWND parent, struct ratio dpi, const RECT *clip, struct list *list )
++{
++    HWND *children = list_window_children( parent );
++    unsigned int count = 0;
++
++    if (!children) return;
++    while (children[count]) count++;
++    while (count)
++    {
++        HWND hwnd = children[--count];
++        struct window_surface *surface = NULL;
++        struct window_rects rects;
++        struct layered_child *child;
++        RECT visible, child_clip;
++        WND *win;
++
++        if (!is_window_visible( hwnd ) || !get_window_rects( hwnd, COORDS_SCREEN, &rects, dpi )) continue;
++        if (!intersect_rect( &visible, &rects.visible, clip )) continue;
++        if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
++        {
++            if ((surface = win->surface)) window_surface_add_ref( surface );
++            release_win_ptr( win );
++        }
++        if (surface && surface->funcs == &offscreen_window_surface_funcs &&
++            (child = malloc( sizeof(*child) )))
++        {
++            child->surface = surface;
++            child->rect = rects.visible;
++            child->clip = visible;
++            list_add_tail( list, &child->entry );
++        }
++        else if (surface) window_surface_release( surface );
++        if (intersect_rect( &child_clip, &rects.client, clip ))
++            collect_layered_children( hwnd, dpi, &child_clip, list );
++    }
++    free( children );
++}
++
++static void free_layered_children( struct list *list )
++{
++    struct layered_child *child, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( child, next, list, struct layered_child, entry )
++    {
++        list_remove( &child->entry );
++        window_surface_release( child->surface );
++        free( child );
++    }
++}
++
++static void compose_layered_child( struct layered_child *child, struct window_surface *target,
++                                   const struct window_rects *target_rects, const BITMAPINFO *target_info,
++                                   UINT32 *target_bits )
++{
++    struct window_surface *surface = child->surface;
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    const UINT32 *bits;
++    int target_stride = target_info->bmiHeader.biWidth;
++    int x, y, source_x, source_y, dest_x, dest_y;
++
++    window_surface_lock( surface );
++    bits = window_surface_get_color( surface, info );
++    if (!bits || info->bmiHeader.biBitCount != 32) goto done;
++    for (y = child->clip.top; y < child->clip.bottom; y++)
++    {
++        source_y = y - child->rect.top - surface->rect.top;
++        dest_y = y - target_rects->visible.top - target->rect.top;
++        if (source_y < 0 || source_y >= -info->bmiHeader.biHeight ||
++            dest_y < 0 || dest_y >= -target_info->bmiHeader.biHeight) continue;
++        for (x = child->clip.left; x < child->clip.right; x++)
++        {
++            source_x = x - child->rect.left - surface->rect.left;
++            dest_x = x - target_rects->visible.left - target->rect.left;
++            if (source_x < 0 || source_x >= info->bmiHeader.biWidth ||
++                dest_x < 0 || dest_x >= target_stride) continue;
++            if (surface->clip_region && !NtGdiPtInRegion( surface->clip_region,
++                x - child->rect.left, y - child->rect.top )) continue;
++            target_bits[dest_y * target_stride + dest_x] =
++                bits[source_y * info->bmiHeader.biWidth + source_x] | 0xff000000;
++        }
++    }
++done:
++    window_surface_unlock( surface );
++}
++
++
++void refresh_window_surface( HWND hwnd )
++{
++    struct window_surface *surface;
++    WND *win;
++
++    for (; hwnd && hwnd != NtUserGetDesktopWindow(); hwnd = NtUserGetAncestor( hwnd, GA_PARENT ))
++    {
++        if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) continue;
++        if ((surface = win->surface)) window_surface_add_ref( surface );
++        release_win_ptr( win );
++        if (!surface) continue;
++        if (surface != &dummy_surface)
++        {
++            window_surface_lock( surface );
++            surface->bounds = surface->rect;
++            window_surface_unlock( surface );
++            window_surface_flush( surface );
++            window_surface_release( surface );
++            break;
++        }
++        window_surface_release( surface );
++    }
++}
++
++
++static void flush_window_surface( struct window_surface *surface, BOOL compose )
+ {
+     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+@@ -635,7 +784,15 @@
+     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
+     RECT dirty = surface->rect, bounds;
+     BOOL flushed = FALSE;
+-    void *color_bits;
++    void *color_bits, *composed = NULL;
++    struct list children = LIST_INIT( children );
++    struct window_rects rects;
++    struct layered_child *child;
++
++    /* Window position updates take the user lock before a surface lock. */
++    if (compose && surface->hwnd && is_composition_surface( surface ) &&
++        get_window_rects( surface->hwnd, COORDS_SCREEN, &rects, get_dpi_for_window( surface->hwnd ) ))
++        collect_layered_children( surface->hwnd, get_dpi_for_window( surface->hwnd ), &rects.client, &children );
+ 
+     window_surface_lock( surface );
+ 
+@@ -649,8 +806,19 @@
+ 
+     if (intersect_rect( &dirty, &dirty, &bounds ) && (color_bits = window_surface_get_color( surface, color_info )))
+     {
+-        BOOL shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
+-        void *shape_bits = window_surface_get_shape( surface, shape_info );
++        BOOL shape_changed;
++        void *shape_bits;
++
++        if (surface->alpha_mask && !list_empty( &children ) && color_info->bmiHeader.biBitCount == 32 &&
++            (composed = malloc( color_info->bmiHeader.biSizeImage )))
++        {
++            memcpy( composed, color_bits, color_info->bmiHeader.biSizeImage );
++            LIST_FOR_EACH_ENTRY( child, &children, struct layered_child, entry )
++                compose_layered_child( child, surface, &rects, color_info, composed );
++            color_bits = composed;
++        }
++        shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
++        shape_bits = window_surface_get_shape( surface, shape_info );
+ 
+         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
+                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+@@ -664,8 +832,18 @@
+     }
+ 
+     window_surface_unlock( surface );
+-
+-    if (flushed && surface->hwnd) present_offscreen_client_surfaces( NtUserGetAncestor( surface->hwnd, GA_ROOT ) );
++    free( composed );
++    free_layered_children( &children );
++
++    if (compose && flushed && surface->hwnd && surface->funcs == &offscreen_window_surface_funcs)
++        refresh_window_surface( NtUserGetAncestor( surface->hwnd, GA_PARENT ) );
++
++    if (compose && flushed && surface->hwnd) present_offscreen_client_surfaces( NtUserGetAncestor( surface->hwnd, GA_ROOT ) );
++}
++
++void window_surface_flush( struct window_surface *surface )
++{
++    flush_window_surface( surface, TRUE );
+ }
+ 
+ void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
+@@ -730,7 +908,7 @@
+     window_surface_unlock( surface );
+ }
+ 
+-void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
++static void set_window_surface_shape( struct window_surface *surface, HRGN shape_region, BOOL flush )
+ {
+     window_surface_lock( surface );
+ 
+@@ -749,7 +927,12 @@
+ 
+     window_surface_unlock( surface );
+ 
+-    window_surface_flush( surface );
++    if (flush) window_surface_flush( surface );
++}
++
++void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
++{
++    set_window_surface_shape( surface, shape_region, TRUE );
+ }
+ 
+ /*******************************************************************
+diff --git a/server/window.c b/server/window.c
+--- a/server/window.c
++++ b/server/window.c
+@@ -1262,6 +1262,7 @@
+ {
+     struct region *tmp = NULL, *region;
+     int offset_x, offset_y;
++    int separate_surface = !!(win->paint_flags & PAINT_HAS_SURFACE);
+ 
+     if (!(region = create_empty_region())) return NULL;
+ 
+@@ -1320,7 +1321,13 @@
+             offset_x += win->client_rect.left;
+             offset_y += win->client_rect.top;
+             offset_region( region, win->client_rect.left, win->client_rect.top );
+-            set_region_client_rect( tmp, win );
++            if (separate_surface)
++            {
++                struct rectangle rect;
++                intersect_rect( &rect, &win->window_rect, &win->client_rect );
++                set_region_rect( tmp, &rect );
++            }
++            else set_region_client_rect( tmp, win );
+             if (win->win_region && !intersect_window_region( tmp, win )) goto error;
+             if (!intersect_region( region, region, tmp )) goto error;
+             if (is_region_empty( region )) break;
+diff --git a/dlls/winex11.drv/bitblt.c b/dlls/winex11.drv/bitblt.c
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -1795,7 +1795,8 @@
+ {
+     UINT alpha_mask = window_surface->alpha_mask, alpha_bits = window_surface->alpha_bits;
+     struct x11drv_window_surface *surface = get_x11_surface( window_surface );
+-    XImage *ximage = surface->image->ximage;
++    XImage *ximage = surface->image->ximage, temporary_image;
++    BOOL temporary = FALSE;
+     const unsigned char *src = color_bits;
+     unsigned char *dst = (unsigned char *)ximage->data;
+ 
+@@ -1808,6 +1809,18 @@
+             DWORD *colors = (DWORD *)color_info->bmiColors;
+             alpha_bits = ~(colors[0] | colors[1] | colors[2]);
+         }
++    }
++
++    if (src != dst && !surface->byteswap && ximage->bits_per_pixel == 32 &&
++        color_info->bmiHeader.biBitCount == 32 &&
++        ximage->bytes_per_line == color_info->bmiHeader.biWidth * 4 &&
++        alpha_mask)
++    {
++        temporary_image = *ximage;
++        temporary_image.data = (char *)src;
++        ximage = &temporary_image;
++        dst = (unsigned char *)src;
++        temporary = TRUE;
+     }
+ 
+     if (src != dst)
+@@ -1820,7 +1833,7 @@
+         copy_image_byteswap( color_info, src, dst, width_bytes, width_bytes, dirty->bottom - dirty->top,
+                              surface->byteswap, mapping, ~0u, alpha_bits );
+     }
+-    else if (alpha_bits)
++    else if (alpha_bits && !temporary)
+     {
+         int x, y, stride = ximage->bytes_per_line / sizeof(ULONG);
+         ULONG *ptr = (ULONG *)dst + dirty->top * stride;
+@@ -1852,7 +1865,7 @@
+             RECT full = {0, 0, rect->right - rect->left, rect->bottom - rect->top};
+ 
+             XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, None, ShapeSet );
+-            if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, &full ))
++            if (temporary || !put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, &full ))
+                 XPutImage( gdi_display, surface->window, surface->gc, ximage, 0, 0, rect->left, rect->top,
+                            full.right, full.bottom );
+         }
+@@ -1861,7 +1874,7 @@
+ #endif /* HAVE_LIBXSHAPE */
+     }
+ 
+-    if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
++    if (temporary || !put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
+         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
+                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
+                    dirty->right - dirty->left, dirty->bottom - dirty->top );
