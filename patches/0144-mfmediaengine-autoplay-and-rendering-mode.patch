@@ -1,0 +1,281 @@
+mfmediaengine: Autoplay, and present video in rendering mode (MF_MEDIA_ENGINE_PLAYBACK_HWND).
+
+Photoshop 2027's "What's new" dialog (the UXP plugin com.adobe.photoshop.inAppMessaging) showed an empty grey box
+where each card's video belongs. UXP's <video> creates its IMFMediaEngine in rendering mode: only
+MF_MEDIA_ENGINE_CALLBACK and MF_MEDIA_ENGINE_PLAYBACK_HWND, no MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT. Three gaps:
+
+1. media_engine_create_video_renderer failed with "Output format was not specified", so the topology had no video
+   branch. In rendering mode it now uses B8G8R8X8.
+2. Wine never drew anything in rendering mode. A render thread now takes the frame due at the presentation clock
+   from the frame sink and draws it into the playback window with StretchDIBits, aspect-fitted (HALFTONE). Size and
+   stride come from the sink's current type; RGB with no stride is bottom-up, as for a DIB. The thread is joined in
+   free_media_engine.
+3. SetAutoPlay stored the flag but nothing used it, and UXP's <video autoplay> never calls Play(). As in the HTML
+   media element, a paused engine with autoplay set now starts when its source has loaded.
+
+Tests: tests/mf/mfautoplay.c (SetAutoPlay, no Play: before FAIL, never plays; after PASS) and tests/mf/mfhwnd.c
+(rendering-mode playback into a window, counts lit pixels: before FAIL 0 pixels; after PASS 147371/147456).
+
+diff --git a/dlls/mfmediaengine/Makefile.in b/dlls/mfmediaengine/Makefile.in
+index cc8e69f..5263414 100644
+--- a/dlls/mfmediaengine/Makefile.in
++++ b/dlls/mfmediaengine/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = mfmediaengine.dll
+-IMPORTS = oleaut32 ole32 mfplat mf mfuuid uuid
++IMPORTS = oleaut32 ole32 mfplat mf mfuuid uuid user32 gdi32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 4b5c9df..8447d8f 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -23,6 +23,8 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "wingdi.h"
++#include "winuser.h"
+ 
+ #include "mfapi.h"
+ #include "mfmediaengine.h"
+@@ -151,6 +153,9 @@ struct media_engine
+     IMFDXGIDeviceManager *device_manager;
+     HANDLE device_handle;
+     enum media_engine_mode mode;
++    HWND playback_hwnd;
++    HANDLE render_thread;
++    volatile LONG render_stop;
+     unsigned int flags;
+     double playback_rate;
+     double default_playback_rate;
+@@ -941,6 +946,8 @@ static HRESULT media_engine_set_rate(struct media_engine *engine, BOOL thin, dou
+ static HRESULT media_engine_set_current_time(struct media_engine *engine, double seektime);
+ static void media_engine_start_playback(struct media_engine *engine);
+ 
++static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface);
++
+ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+     struct media_engine *engine = impl_from_session_events_IMFAsyncCallback(iface);
+@@ -1268,8 +1275,13 @@ static HRESULT media_engine_create_video_renderer(struct media_engine *engine, I
+ 
+     if (FAILED(IMFAttributes_GetUINT32(engine->attributes, &MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, &output_format)))
+     {
+-        WARN("Output format was not specified.\n");
+-        return E_FAIL;
++        if (engine->mode != MEDIA_ENGINE_RENDERING_MODE)
++        {
++            WARN("Output format was not specified.\n");
++            return E_FAIL;
++        }
++        /* Rendering mode: the engine presents to MF_MEDIA_ENGINE_PLAYBACK_HWND itself (see render_thread_proc). */
++        output_format = DXGI_FORMAT_B8G8R8X8_UNORM;
+     }
+ 
+     memcpy(&subtype, &MFVideoFormat_Base, sizeof(subtype));
+@@ -1527,6 +1539,13 @@ static HRESULT WINAPI media_engine_load_handler_Invoke(IMFAsyncCallback *iface,
+     engine->network_state = MF_MEDIA_ENGINE_NETWORK_LOADING;
+     IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_LOADSTART, 0, 0);
+ 
++    /* Like the HTML autoplay attribute: a paused engine with autoplay set starts by itself once its source loads,
++     * as on Windows (Photoshop's What's New videos are UXP <video autoplay> elements and never call Play). The
++     * source is still pending here, so Play() only marks the start as pending and it is taken up just below. */
++    if ((engine->flags & (FLAGS_ENGINE_AUTO_PLAY | FLAGS_ENGINE_PAUSED)) == (FLAGS_ENGINE_AUTO_PLAY | FLAGS_ENGINE_PAUSED)
++            && !(engine->flags & (FLAGS_ENGINE_WAITING | FLAGS_ENGINE_SCRUBBING)))
++        media_engine_Play(&engine->IMFMediaEngineEx_iface);
++
+     start_playback = engine->flags & FLAGS_ENGINE_PLAY_PENDING;
+     media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
+ 
+@@ -1624,8 +1643,158 @@ static ULONG WINAPI media_engine_AddRef(IMFMediaEngineEx *iface)
+     return refcount;
+ }
+ 
++/* Rendering mode (MF_MEDIA_ENGINE_PLAYBACK_HWND): Windows draws the video into the window itself. Photoshop's UXP
++ * <video> (What's New, in-app tips) creates its engine this way, with no output format, so the video stayed blank.
++ * Present the frame due at the presentation clock with GDI, aspect-fitted to the client area. */
++static DWORD CALLBACK render_thread_proc(void *arg)
++{
++    struct media_engine *engine = arg;
++    LONGLONG last_pts = MINLONGLONG, pts;
++    DWORD last_draw = 0;
++    BYTE *bits = NULL;
++    SIZE size = {0};
++    LONG stride_hint = 0;
++
++    SetThreadDescription(GetCurrentThread(), L"wine_mfmediaengine_render");
++
++    while (!engine->render_stop)
++    {
++        BOOL draw = FALSE;
++        MFTIME clocktime;
++
++        Sleep(10);
++        EnterCriticalSection(&engine->cs);
++        if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
++        {
++            LeaveCriticalSection(&engine->cs);
++            break;
++        }
++        if (engine->presentation.frame_sink && engine->video_frame.size.cx && engine->video_frame.size.cy)
++        {
++            IMFSample *sample = NULL;
++            pts = MINLONGLONG;
++            if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
++                video_frame_sink_get_pts(engine->presentation.frame_sink, clocktime, &pts);
++            if ((pts != last_pts || GetTickCount() - last_draw > 250)
++                    && video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
++            {
++                IMFMediaBuffer *buffer;
++                IMF2DBuffer *buffer2d;
++                BYTE *data;
++                LONG pitch;
++                DWORD len;
++                int y;
++
++                /* The decoded frames can differ from the source's frame size (the topology may scale, or the
++                 * decoder may pad): take size and stride from the sink's negotiated type. */
++                {
++                    SIZE cur = engine->video_frame.size;
++                    IMFStreamSink *stream;
++                    IMFMediaTypeHandler *handler;
++                    IMFMediaType *type;
++                    UINT64 frame_size;
++                    UINT32 stride;
++
++                    stride_hint = 0;
++                    if (SUCCEEDED(video_frame_sink_query_iface(engine->presentation.frame_sink, &IID_IMFStreamSink, (void **)&stream)))
++                    {
++                        if (SUCCEEDED(IMFStreamSink_GetMediaTypeHandler(stream, &handler)))
++                        {
++                            if (SUCCEEDED(IMFMediaTypeHandler_GetCurrentMediaType(handler, &type)))
++                            {
++                                if (SUCCEEDED(IMFMediaType_GetUINT64(type, &MF_MT_FRAME_SIZE, &frame_size)) && frame_size)
++                                {
++                                    cur.cx = frame_size >> 32;
++                                    cur.cy = (UINT32)frame_size;
++                                }
++                                if (SUCCEEDED(IMFMediaType_GetUINT32(type, &MF_MT_DEFAULT_STRIDE, &stride)))
++                                    stride_hint = (INT32)stride;
++                                IMFMediaType_Release(type);
++                            }
++                            IMFMediaTypeHandler_Release(handler);
++                        }
++                        IMFStreamSink_Release(stream);
++                    }
++                    if (size.cx != cur.cx || size.cy != cur.cy)
++                    {
++                        size = cur;
++                        free(bits);
++                        bits = malloc(size.cx * size.cy * 4);
++                    }
++                }
++                if (bits && SUCCEEDED(IMFSample_GetBufferByIndex(sample, 0, &buffer)))
++                {
++                    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer, (void **)&buffer2d)))
++                    {
++                        if (SUCCEEDED(IMF2DBuffer_Lock2D(buffer2d, &data, &pitch)))
++                        {
++                            for (y = 0; y < size.cy; y++)
++                                memcpy(bits + y * size.cx * 4, data + y * pitch, size.cx * 4);
++                            IMF2DBuffer_Unlock2D(buffer2d);
++                            draw = TRUE;
++                        }
++                        IMF2DBuffer_Release(buffer2d);
++                    }
++                    else if (SUCCEEDED(IMFMediaBuffer_Lock(buffer, &data, NULL, &len)))
++                    {
++                        LONG row = abs(stride_hint) >= size.cx * 4 ? abs(stride_hint) : size.cx * 4;
++
++                        /* RGB with no stride in its type is bottom-up, as for a DIB */
++                        if (!stride_hint) stride_hint = -row;
++                        if (len >= row * size.cy)
++                        {
++                            for (y = 0; y < size.cy; y++)
++                                memcpy(bits + y * size.cx * 4, data + (stride_hint < 0 ? size.cy - 1 - y : y) * row, size.cx * 4);
++                            draw = TRUE;
++                        }
++                        else WARN("Sample of %lu bytes for %ldx%ld.\n", len, size.cx, size.cy);
++                        IMFMediaBuffer_Unlock(buffer);
++                    }
++                    IMFMediaBuffer_Release(buffer);
++                }
++                IMFSample_Release(sample);
++                last_pts = pts;
++            }
++        }
++        LeaveCriticalSection(&engine->cs);
++
++        if (draw)
++        {
++            BITMAPINFO bmi = {{sizeof(BITMAPINFOHEADER)}};
++            RECT rc;
++            HDC hdc;
++
++            last_draw = GetTickCount();
++            if (!IsWindowVisible(engine->playback_hwnd) || !GetClientRect(engine->playback_hwnd, &rc)
++                    || rc.right <= 0 || rc.bottom <= 0 || !(hdc = GetDC(engine->playback_hwnd)))
++                continue;
++            bmi.bmiHeader.biWidth = size.cx;
++            bmi.bmiHeader.biHeight = -size.cy;    /* RGB32 samples are top-down */
++            bmi.bmiHeader.biPlanes = 1;
++            bmi.bmiHeader.biBitCount = 32;
++            bmi.bmiHeader.biCompression = BI_RGB;
++            {
++                LONG w = rc.right, h = MulDiv(rc.right, size.cy, size.cx), x = 0, yy;
++                if (h > rc.bottom) { h = rc.bottom; w = MulDiv(rc.bottom, size.cx, size.cy); }
++                x = (rc.right - w) / 2; yy = (rc.bottom - h) / 2;
++                SetStretchBltMode(hdc, HALFTONE);
++                StretchDIBits(hdc, x, yy, w, h, 0, 0, size.cx, size.cy, bits, &bmi, DIB_RGB_COLORS, SRCCOPY);
++            }
++            ReleaseDC(engine->playback_hwnd, hdc);
++        }
++    }
++    free(bits);
++    return 0;
++}
++
+ static void free_media_engine(struct media_engine *engine)
+ {
++    if (engine->render_thread)
++    {
++        engine->render_stop = TRUE;
++        WaitForSingleObject(engine->render_thread, INFINITE);
++        CloseHandle(engine->render_thread);
++    }
+     if (engine->callback)
+         IMFMediaEngineNotify_Release(engine->callback);
+     if (engine->clock)
+@@ -2203,7 +2372,7 @@ static HRESULT WINAPI media_engine_SetAutoPlay(IMFMediaEngineEx *iface, BOOL aut
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+ 
+-    FIXME("(%p, %d): stub.\n", iface, autoplay);
++    TRACE("%p, %d.\n", iface, autoplay);
+ 
+     EnterCriticalSection(&engine->cs);
+     media_engine_set_flag(engine, FLAGS_ENGINE_AUTO_PLAY, autoplay);
+@@ -2230,7 +2399,7 @@ static HRESULT WINAPI media_engine_SetLoop(IMFMediaEngineEx *iface, BOOL loop)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+ 
+-    FIXME("(%p, %d): stub.\n", iface, loop);
++    TRACE("%p, %d.\n", iface, loop);
+ 
+     EnterCriticalSection(&engine->cs);
+     media_engine_set_flag(engine, FLAGS_ENGINE_LOOP, loop);
+@@ -3663,7 +3832,12 @@ static HRESULT init_media_engine(DWORD flags, IMFAttributes *attributes, struct
+     IMFAttributes_GetUINT64(attributes, &MF_MEDIA_ENGINE_PLAYBACK_HWND, &playback_hwnd);
+     hr = IMFAttributes_GetUINT32(attributes, &MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, &output_format);
+     if (playback_hwnd) /* FIXME: handle MF_MEDIA_ENGINE_PLAYBACK_VISUAL */
++    {
+         engine->mode = MEDIA_ENGINE_RENDERING_MODE;
++        engine->playback_hwnd = (HWND)(ULONG_PTR)playback_hwnd;
++        if (FAILED(IMFAttributes_GetItem(attributes, &MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, NULL)))
++            engine->render_thread = CreateThread(NULL, 0, render_thread_proc, engine, 0, NULL);
++    }
+     else
+     {
+         if (SUCCEEDED(hr))

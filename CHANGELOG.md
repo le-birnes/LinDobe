@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **After Effects 2027 starts reliably.** It crashed at most starts: while After Effects changes the language settings from several threads during startup, Wine's number reading (strtod, sscanf) could use settings another thread had just freed. Patch 0146.
+
+- **Photoshop 2027's What's New videos play.** They stayed blank, and once playing, the 854-pixel-wide video was sheared with a colour ghost. Patches 0144 and 0145.
+
 - **Native Adobe projects are recognized by the file manager.** `adobewine launchers` now registers MIME extension rules and handlers for After Effects, Premiere Pro, Audition sessions, InDesign, InCopy, Animate and Lightroom Classic, plus missing Photoshop and Illustrator native extensions. Existing default-application preferences are preserved. Rerun `adobewine launchers` after updating; no Wine rebuild is needed. See [file associations](docs/FILE-ASSOCIATIONS.md).
 
 - **Illustrator no longer freezes when a dropped file opens a dialog.** Dragging an .ai file with missing fonts from the file manager into Illustrator showed the "Missing Fonts" dialog, but it took no clicks or keys and Illustrator used a full CPU core until killed. Wine handled no X events while the drop was being delivered, so a dialog opened during the drop never got any input. Patch 0143. Contributed in #43.
