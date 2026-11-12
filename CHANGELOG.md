@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Illustrator no longer freezes when a dropped file opens a dialog.** Dragging an .ai file with missing fonts from the file manager into Illustrator showed the "Missing Fonts" dialog, but it took no clicks or keys and Illustrator used a full CPU core until killed. Wine handled no X events while the drop was being delivered, so a dialog opened during the drop never got any input. Patch 0143. Contributed in #43.
+
+- **Photoshop's Type Context Bar shows the font and size again, and its font picker selects the row under the cursor.** Patches 0141 and 0142. Contributed in #42.
+
+- **Photoshop's panels no longer get an extra shadow outline or stop responding after a focus switch** (Hyprland/XWayland), while the Smart Guides fix from 0138 stays. Patch 0140. Contributed in #41.
+
 - **Files dragged in from the file manager import into After Effects.** Dropping images on the Project panel or the Composition viewer did nothing unless the drag happened to enter over the Project panel: during a drag, Wine reported a stale mouse position, and After Effects uses the mouse position to decide where a drop lands. Wine now reports the drag's position while a drag is in progress. Patch 0139. Contributed in #39.
 
 - **A file opened from the file manager reaches an Adobe app that is already running at once.** The launcher used to wait 10 seconds first; now only a leftover process without a window gets that wait. Contributed in #37.

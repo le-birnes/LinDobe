@@ -1,0 +1,38 @@
+winex11: Leave the X event context before calling IDropTarget::Drop.
+
+handle_xdnd_drop_event calls drag_drop_drop() synchronously from inside call_event_handler, with
+thread_data->current_event still pointing at the XdndDrop ClientMessage. Illustrator 2026 opens the dropped document
+inside IDropTarget::Drop and shows a modal dialog right there ("Missing Fonts", PDF import options, ...).
+X11DRV_ProcessEvents forces mask = 0 while current_event is set ("don't process nested events"), so the dialog's
+message loop never gets a single X event: no clicks, no keys, and XCheckIfEvent rescans the growing queue forever
+(100% CPU on the main thread). The application is frozen until killed (public #43).
+
+On Windows the drop reaches the target through its own message loop and nested modal loops inside Drop work normally.
+Clear current_event around the drag_drop_drop() call and restore it afterwards; XdndFinished is still sent once Drop
+returns. Contributed in #43.
+
+Test: tests/dragdrop/dropdlg.c opens a MessageBox inside Drop; tests/dragdrop/run_dropdlg.sh drags a file onto it
+from a GTK X11 source and presses Enter on the box (before: FAIL timeout, the box gets no input; after: PASS).
+
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -1578,10 +1578,19 @@
+ 
+ static void handle_xdnd_drop_event( HWND hwnd, XClientMessageEvent *event )
+ {
++    struct x11drv_thread_data *thread_data = x11drv_thread_data();
++    XEvent *prev_event = thread_data->current_event;
+     XClientMessageEvent e;
+     UINT effect;
+ 
++    /* IDropTarget::Drop may run a modal loop (e.g. a "Missing Fonts" dialog after opening
++     * the dropped file). While current_event is set, X11DRV_ProcessEvents processes no X
++     * events at all, so such a dialog would never receive input. On Windows the drop
++     * arrives through the target's message loop, where nested modal loops work, so
++     * leave the event context before calling into the application. */
++    thread_data->current_event = NULL;
+     effect = drag_drop_drop( hwnd );
++    thread_data->current_event = prev_event;
+     xdnd_tracking = 0;
+ 
+     /* Tell the target we are finished. */

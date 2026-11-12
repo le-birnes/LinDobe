@@ -159,3 +159,8 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
   text updates, resizing, movement, visibility and destruction in both creation orders. Photoshop's
   font selection, direct size entry and interaction after focus switches were confirmed in an isolated
   runtime. Scope and validation limits: docs/PHOTOSHOP-CONTEXT-BAR.md.
+- 0143 (2026-11-12, #43): winex11 clears the thread's current X event while it calls IDropTarget::Drop and restores
+  it afterwards. Before, X11DRV_ProcessEvents skipped every X event during the drop, so a modal dialog opened inside
+  Drop (Illustrator's "Missing Fonts") never got input and the main thread spun at 100% CPU. tests/dragdrop/dropdlg.c
+  with run_dropdlg.sh (GTK X11 drag source, xdotool, a hidden X screen): FAIL timeout before, PASS after, 2 of 2 runs
+  each; regression suite 29/0.
