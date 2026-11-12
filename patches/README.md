@@ -149,3 +149,13 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
   still passes with eight paint events. Under virtual KWin 6.8.2/XWayland 24.1.15, original and candidate both
   pass the readout and managed opaque popup probes, including repeated focus switches and hit testing.
   No compositor rule, input-region or window-ownership change is required.
+- 0141 (2026-11-11): winex11 synchronizes externally moved unmanaged popups with Win32 geometry.
+  Photoshop's font picker could appear 35 pixels below its Win32 rectangle and select the wrong row.
+  Desktop, embedded and non-popup unmanaged windows keep their previous behavior. The Xlib move case
+  in tests/layered/context-controls.c fails before and passes after under Xvfb and KWin/XWayland.
+- 0142 (2026-11-11): win32u composites opaque layered GDI children over per-pixel parents from separate
+  caches, restoring font and size text in Photoshop's Type Context Bar. X11 presentation keeps the
+  parent's original pixels intact; scaled surfaces consume the composed image once. The probe checks
+  text updates, resizing, movement, visibility and destruction in both creation orders. Photoshop's
+  font selection, direct size entry and interaction after focus switches were confirmed in an isolated
+  runtime. Scope and validation limits: docs/PHOTOSHOP-CONTEXT-BAR.md.

@@ -1,0 +1,29 @@
+Subject: [PATCH] winex11: Synchronize externally moved unmanaged popups.
+
+XWayland compositors can reposition override-redirect popups. ConfigureNotify
+updates the native rectangle, but window_update_client_config ignores every
+unmanaged window, leaving Win32 hit testing at the old position. Photoshop's
+font picker consequently selects a different row from the one under the cursor.
+
+Allow visible unmanaged popups to follow their actual native rectangle. Keep
+the existing state/serial checks and virtual-desktop exclusion; desktop, embedded
+and non-popup unmanaged windows retain their previous behavior.
+
+The X11-only tests/layered/context-controls.c moves its own override-redirect
+popup through Xlib and checks that the Win32 and native positions agree. It
+fails before this patch and passes after it on Xvfb and KWin/XWayland.
+
+---
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -1768,7 +1768,8 @@
+     long old_monitors[4], monitors[4];
+     UINT flags;
+ 
+-    if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
++    if (!data->managed && (data->whole_window == root_window || data->embedded ||
++        !(NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_POPUP))) return 0;
+     if (is_virtual_desktop()) return 0; /* ignore window manager config changes in virtual desktop mode */
+     if (data->desired_state.wm_state != NormalState) return 0; /* ignore config changes on invisible/minimized windows */
+ 

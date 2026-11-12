@@ -51,3 +51,33 @@ container, using software rendering. All four cases passed: unmanaged mode
 reported eight paint events in each runtime, and managed mode reported ten.
 These are API regression checks, not visual Photoshop validation on KDE or
 coverage of every KWin version and graphics driver.
+
+## Type Context Bar controls and popup geometry
+
+`context-controls.c` is an X11-only Winelib regression probe for patches 0141
+and 0142. It requires the Wine SDK and Xlib development headers:
+
+```sh
+/opt/adobewine/runtime/bin/winegcc -m64 -O1 -Wall -Wextra \
+  -o /tmp/context-controls.exe tests/layered/context-controls.c -luser32 -lgdi32 -lX11
+WINEPREFIX=/tmp/context-controls-prefix /path/to/runtime/bin/wine /tmp/context-controls.exe.so
+WINEPREFIX=/tmp/context-controls-prefix /path/to/runtime/bin/wine /tmp/context-controls.exe.so --late-parent
+```
+
+Use a disposable prefix with each runtime. The probe opens its own small test
+windows; its pixel checks never read an Adobe window or capture a screenshot.
+The original runtime exits nonzero because the layered Edit is invisible and
+the override-redirect popup keeps stale Win32 coordinates after an Xlib move.
+The candidate must exit zero in both creation orders.
+
+Rendering checks cover text changes, repeated parent updates, resizing,
+control/container movement and visibility, destruction, and simultaneous GDI
+painting and window movement on separate threads. Opaque and
+constant-alpha parents remain control cases. `--late-parent` initializes the
+per-pixel parent after creating its controls. Native pixel coordinates are
+mapped to the actual X11 window size, and popup comparisons account for DPI
+virtualization. The geometry case requires a genuine override-redirect popup.
+
+Both orders pass on Xvfb and virtual KWin/XWayland; the latter also passes
+both orders at 144 DPI. A disposable-prefix Xvfb run also passes at 144 DPI.
+See [the diagnosis and limits](../../docs/PHOTOSHOP-CONTEXT-BAR.md).
