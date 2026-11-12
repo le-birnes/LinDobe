@@ -142,6 +142,13 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
   after mapping, instead of leaving opaque padding around Photoshop's small measurement readouts.
   tests/layered/alpha-map.c: geometry and transparent-padding hit testing pass before and after, with eight
   paint events in each Xvfb run. Compositor-added blur is separate; see docs/PHOTOSHOP-OVERLAYS.md.
+- 0140 (2026-11-10): winex11 limits the 0138 map-time alpha refresh to unmanaged windows. Photoshop's managed
+  panel shadow owners otherwise show an extra outline on Hyprland/XWayland, with reported interaction failures
+  after switching focus. An isolated comparison without 0138 removes the outline; with 0138 plus 0140, the user
+  confirmed normal panels across focus switches and Smart Guides without black boxes. The alpha-map API probe
+  still passes with eight paint events. Under virtual KWin 6.8.2/XWayland 24.1.15, original and candidate both
+  pass the readout and managed opaque popup probes, including repeated focus switches and hit testing.
+  No compositor rule, input-region or window-ownership change is required.
 - 0141 (2026-11-11): winex11 synchronizes externally moved unmanaged popups with Win32 geometry.
   Photoshop's font picker could appear 35 pixels below its Win32 rectangle and select the wrong row.
   Desktop, embedded and non-popup unmanaged windows keep their previous behavior. The Xlib move case
