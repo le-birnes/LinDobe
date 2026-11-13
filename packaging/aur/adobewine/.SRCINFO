@@ -27,6 +27,7 @@ pkgbase = adobewine
 	makedepends = glslang
 	makedepends = python
 	depends = desktop-file-utils
+	depends = shared-mime-info
 	depends = fontconfig
 	depends = freetype2
 	depends = libgcc
@@ -63,7 +64,7 @@ pkgbase = adobewine
 	options = staticlibs
 	source = adobewine-0.6.0.tar.gz::https://github.com/le-birnes/LinDobe/archive/refs/tags/v0.6.0.tar.gz
 	source = https://dl.winehq.org/wine/source/11.x/wine-11.20.tar.xz
-	sha256sums = 3c998e587293ee92ff699d1e4313b9b6d40b287c55fa007f828d4070e0090f86
+	sha256sums = 4015af2c923a247c2fe1e7fcae707185300cfe9179aa4d20eef1ea22fd883fb7
 	sha256sums = eac8ca448f9c0087f963026b4dc276d1e2b7fbb64056edc093e59bbb7e56fe28
 
 pkgname = adobewine
