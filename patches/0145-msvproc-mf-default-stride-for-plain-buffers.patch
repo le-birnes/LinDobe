@@ -1,0 +1,79 @@
+msvproc, mf: Use MF_MT_DEFAULT_STRIDE for plain buffers; do not copy a stride across pixel formats.
+
+After 0144, Photoshop 2027's What's New videos played but the 854x480 one was sheared, with a ghost in one colour.
+The media source decodes in GStreamer, which pads 854-wide NV12 rows to 856 and says so in the type
+(MF_MT_DEFAULT_STRIDE 856; the buffer holds 616320 bytes). Two problems:
+
+1. msvproc read a plain IMFMediaBuffer (no IMF2DBuffer2, so pitch 0) with tightly packed 854-byte rows: every row
+   slid by two more pixels, and the chroma plane started in the wrong place. It now takes the pitch of such buffers
+   from the positive MF_MT_DEFAULT_STRIDE of its input and output types.
+2. The topology loader copied MF_MT_DEFAULT_STRIDE from the upstream type onto the downstream type even when the
+   subtypes differ, so the RGB32 output got "856", a NV12 luma stride. It now copies the stride only between equal
+   subtypes.
+
+Test: a 854x480 test pattern through tests/mf/mfhwnd.c (window dump compared with ffmpeg's frame): before, sheared;
+after, identical layout. tests/mf/mfread.c (source reader) unchanged, 229 samples.
+
+--- a/dlls/msvproc/video_processor.c
++++ b/dlls/msvproc/video_processor.c
+@@ -328,6 +328,7 @@
+     IMFMediaType *output_type;
+     MFVIDEOFORMAT *output_format;
+     MFT_OUTPUT_STREAM_INFO output_info;
++    LONG input_stride, output_stride; /* positive MF_MT_DEFAULT_STRIDE, used for buffers without a 2D pitch */
+ 
+     SwsContext *context;
+     AVFrame input_frame;
+@@ -350,6 +351,7 @@
+ 
+     if (!(buffer = buffer_from_media_buffer(output->pBuffer, 0, &pitch)))
+         return E_OUTOFMEMORY;
++    if (!pitch) pitch = impl->output_stride;
+     if ((size = video_frame_wrap_buffer(&output_frame, impl->output_format, buffer, pitch)) < 0)
+         av_frame_move_ref(&output_frame, &impl->output_frame);
+ 
+@@ -416,6 +418,7 @@
+ 
+     if (!(buffer = buffer_from_media_buffer(input->pBuffer, AV_BUFFER_FLAG_READONLY, &pitch)))
+         return E_OUTOFMEMORY;
++    if (!pitch) pitch = impl->input_stride;
+     if ((ret = video_frame_wrap_buffer(&impl->current_frame, impl->input_format, buffer, pitch)) < 0)
+     {
+         ret = video_frame_copy_from_buffer(&impl->input_frame, impl->input_format, buffer, pitch);
+@@ -546,6 +549,15 @@
+ 
+     update_video_aperture(&impl->input_format->videoInfo, &impl->output_format->videoInfo);
+ 
++    /* a plain buffer has no pitch of its own: rows follow the type's default stride (GStreamer pads 854-wide
++     * NV12 rows to 856 and says so there) */
++    if (FAILED(IMFMediaType_GetUINT32(impl->input_type, &MF_MT_DEFAULT_STRIDE, (UINT32 *)&impl->input_stride))
++            || impl->input_stride < 0)
++        impl->input_stride = 0;
++    if (FAILED(IMFMediaType_GetUINT32(impl->output_type, &MF_MT_DEFAULT_STRIDE, (UINT32 *)&impl->output_stride))
++            || impl->output_stride < 0)
++        impl->output_stride = 0;
++
+     video_frame_init_from_format(&impl->input_frame, impl->input_format);
+     if ((ret = av_frame_get_buffer(&impl->input_frame, 0)) < 0)
+         goto failed;
+--- a/dlls/mf/topology_loader.c
++++ b/dlls/mf/topology_loader.c
+@@ -319,12 +319,17 @@
+ /* also present in mfreadwrite/reader.c pipeline */
+ static HRESULT update_media_type_from_upstream(IMFMediaType *media_type, IMFMediaType *upstream_type)
+ {
++    GUID subtype, upstream_subtype;
+     HRESULT hr = S_OK;
+ 
+     /* propagate common video attributes */
+     media_type_try_copy_attr(media_type, upstream_type, &MF_MT_FRAME_SIZE, &hr);
+     media_type_try_copy_attr(media_type, upstream_type, &MF_MT_FRAME_RATE, &hr);
+-    media_type_try_copy_attr(media_type, upstream_type, &MF_MT_DEFAULT_STRIDE, &hr);
++    /* a stride belongs to its pixel format: NV12's 856 is not an RGB32 stride */
++    if (SUCCEEDED(IMFMediaType_GetGUID(media_type, &MF_MT_SUBTYPE, &subtype))
++            && SUCCEEDED(IMFMediaType_GetGUID(upstream_type, &MF_MT_SUBTYPE, &upstream_subtype))
++            && IsEqualGUID(&subtype, &upstream_subtype))
++        media_type_try_copy_attr(media_type, upstream_type, &MF_MT_DEFAULT_STRIDE, &hr);
+     media_type_try_copy_attr(media_type, upstream_type, &MF_MT_VIDEO_ROTATION, &hr);
+     media_type_try_copy_attr(media_type, upstream_type, &MF_MT_FIXED_SIZE_SAMPLES, &hr);
+     media_type_try_copy_attr(media_type, upstream_type, &MF_MT_PIXEL_ASPECT_RATIO, &hr);

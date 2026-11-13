@@ -70,8 +70,8 @@ checkout of the AUR package installs them without building anything.
 > signature file, and the release doesn't have one.)
 >
 > ```sh
-> curl -LO https://github.com/le-birnes/LinDobe/releases/download/v0.5.5/adobewine-0.5.5-1-x86_64.pkg.tar.zst
-> sudo pacman -U adobewine-0.5.5-1-x86_64.pkg.tar.zst
+> curl -LO https://github.com/le-birnes/LinDobe/releases/download/v0.6.0/adobewine-0.6.0-1-x86_64.pkg.tar.zst
+> sudo pacman -U adobewine-0.6.0-1-x86_64.pkg.tar.zst
 > ```
 >
 > Or build it from this repository:

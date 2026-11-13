@@ -164,3 +164,16 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
   Drop (Illustrator's "Missing Fonts") never got input and the main thread spun at 100% CPU. tests/dragdrop/dropdlg.c
   with run_dropdlg.sh (GTK X11 drag source, xdotool, a hidden X screen): FAIL timeout before, PASS after, 2 of 2 runs
   each; regression suite 29/0.
+- 0144 (2026-11-12): mfmediaengine plays on load when autoplay is set and implements the rendering mode
+  (MF_MEDIA_ENGINE_PLAYBACK_HWND: a render thread draws each frame with StretchDIBits; RGB without a stride is read
+  bottom-up). Photoshop 2027's What's New videos stayed blank. tests/mf/mfautoplay.c, mfhwnd.c: before, no frames;
+  after, the clip plays in the window.
+- 0145 (2026-11-12): msvproc takes the pitch of plain buffers (no IMF2DBuffer2) from the positive
+  MF_MT_DEFAULT_STRIDE, and the topology loader copies the stride only between equal subtypes. GStreamer pads 854-wide
+  NV12 rows to 856, so Photoshop 2027's 854x480 video was sheared with a colour ghost. tests/mf/mfhwnd.c in layout
+  mode with layout.mp4 from mkvideo.sh: before, sheared; after, the five sample points match.
+- 0146 (2026-11-12): msvcrt strtod_helper, the scanf family, _strlwr_s_l, _strupr_s_l, _strnicmp_l, _mblen_l and
+  _mbtowc_l wrap the locinfo they fetched in a local locale and pass it to nested calls. Before, a nested
+  _isspace_l(c, NULL) refetched the thread locale and freed the old one after another thread's setlocale, and the
+  caller kept using freed memory: After Effects 2027 crashed at most starts in fpnum_parse_bnum.
+  tests/locale/localerace.c: page fault before, PASS after; After Effects 2027 5 of 5 clean starts.
