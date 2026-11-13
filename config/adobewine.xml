@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="image/vnd.adobe.photoshop">
+    <comment>Adobe Photoshop document</comment>
+    <glob pattern="*.psd"/>
+    <glob pattern="*.psb"/>
+    <glob pattern="*.psdt"/>
+  </mime-type>
+  <mime-type type="application/illustrator">
+    <comment>Adobe Illustrator document</comment>
+    <glob pattern="*.ai"/>
+    <glob pattern="*.ait"/>
+  </mime-type>
+  <mime-type type="application/x-aftereffects">
+    <comment>Adobe After Effects project</comment>
+    <generic-icon name="video-x-generic"/>
+    <glob pattern="*.aep"/>
+    <glob pattern="*.aepx"/>
+    <glob pattern="*.aet"/>
+  </mime-type>
+  <mime-type type="application/x-premiere">
+    <comment>Adobe Premiere Pro project</comment>
+    <generic-icon name="video-x-generic"/>
+    <glob pattern="*.prproj"/>
+  </mime-type>
+  <mime-type type="application/x-audition">
+    <comment>Adobe Audition session</comment>
+    <generic-icon name="audio-x-generic"/>
+    <glob pattern="*.sesx"/>
+  </mime-type>
+  <mime-type type="application/x-indesign">
+    <comment>Adobe InDesign document</comment>
+    <generic-icon name="x-office-document"/>
+    <glob pattern="*.indd"/>
+    <glob pattern="*.indt"/>
+    <glob pattern="*.indb"/>
+    <glob pattern="*.indl"/>
+    <glob pattern="*.idml"/>
+    <glob pattern="*.idap"/>
+  </mime-type>
+  <mime-type type="application/x-incopy">
+    <comment>Adobe InCopy document</comment>
+    <generic-icon name="x-office-document"/>
+    <glob pattern="*.icml"/>
+    <glob pattern="*.icmt"/>
+    <glob pattern="*.icma"/>
+    <glob pattern="*.icap"/>
+  </mime-type>
+  <mime-type type="application/x-animate">
+    <comment>Adobe Animate document</comment>
+    <generic-icon name="video-x-generic"/>
+    <glob pattern="*.fla"/>
+    <glob pattern="*.xfl"/>
+  </mime-type>
+  <mime-type type="application/x-lightroom-catalog">
+    <comment>Adobe Lightroom Classic catalog</comment>
+    <generic-icon name="image-x-generic"/>
+    <glob pattern="*.lrcat"/>
+  </mime-type>
+</mime-info>
