@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-11-13
 
 - **After Effects 2027 starts reliably.** It crashed at most starts: while After Effects changes the language settings from several threads during startup, Wine's number reading (strtod, sscanf) could use settings another thread had just freed. Patch 0146.
 

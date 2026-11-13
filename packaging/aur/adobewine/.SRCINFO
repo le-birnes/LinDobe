@@ -1,6 +1,6 @@
 pkgbase = adobewine
 	pkgdesc = LinDobe: Wine 11.20 with patches for Adobe Creative Cloud apps (Photoshop, Illustrator, Premiere Pro, Audition, Media Encoder)
-	pkgver = 0.5.5
+	pkgver = 0.6.0
 	pkgrel = 1
 	url = https://github.com/le-birnes/LinDobe
 	arch = x86_64
@@ -61,7 +61,7 @@ pkgbase = adobewine
 	options = !lto
 	options = !debug
 	options = staticlibs
-	source = adobewine-0.5.5.tar.gz::https://github.com/le-birnes/LinDobe/archive/refs/tags/v0.5.5.tar.gz
+	source = adobewine-0.6.0.tar.gz::https://github.com/le-birnes/LinDobe/archive/refs/tags/v0.6.0.tar.gz
 	source = https://dl.winehq.org/wine/source/11.x/wine-11.20.tar.xz
 	sha256sums = 3c998e587293ee92ff699d1e4313b9b6d40b287c55fa007f828d4070e0090f86
 	sha256sums = eac8ca448f9c0087f963026b4dc276d1e2b7fbb64056edc093e59bbb7e56fe28
