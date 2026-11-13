@@ -159,7 +159,7 @@ modules:
       - type: patch
         path: ../../patches-deps/vkd3d-proton-3.0.1-export-shared-buffers.patch
         dest: deps/src/vkd3d-proton-adobewine
-      - type: git                     # d3d11.dll: Intel GPU counter for Premiere, idle swapchains given up (Audition)
+      - type: git                     # d3d11.dll: Intel GPU counter for Premiere, idle swapchains given up (Audition), WinRT surfaces (Lightroom)
         url: https://github.com/doitsujin/dxvk.git
         tag: v3.1.1
         commit: b1a1c99ab52b687cf950d62c88bc2fa316b41663
@@ -168,6 +168,7 @@ modules:
         paths:
           - ../../patches-deps/dxvk-3.1.1-intel-device-information-counter.patch
           - ../../patches-deps/dxvk-3.1.1-release-idle-swapchains-past-the-nvidia-limit.patch
+          - ../../patches-deps/dxvk-3.1.1-winrt-surface-interop.patch
         dest: deps/src/dxvk-adobewine
       - type: git
         url: https://github.com/SveSop/nvcuda.git
