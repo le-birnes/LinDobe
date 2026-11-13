@@ -32,13 +32,17 @@ x86_64-w64-mingw32-strip "$OUT/d3d12core.dll"
 # DXVK 3.1.1 d3d11.dll: Intel's "Intel Device Information" counter (Premiere reads the GPU generation from it and
 # otherwise rejects Intel GPUs as "Hardware out of date"); idle presenters give up their Vulkan swapchain past 192 live
 # ones, as the NVIDIA driver refuses the 253rd, and at once when their window was destroyed, as such a swapchain can
-# make the NVIDIA driver lose the device (Audition's long-session hang; tests/misc/swapchurn.c, vkswapcap.c)
+# make the NVIDIA driver lose the device (Audition's long-session hang; tests/misc/swapchurn.c, vkswapcap.c); WinRT
+# surfaces from DXGI ones (CreateDirect3D11SurfaceFromDXGISurface, which Lightroom Classic imports)
 D=$SRC/dxvk-adobewine
 if [ ! -d "$D" ]; then
   git clone -q --branch v3.1.1 --depth 1 https://github.com/doitsujin/dxvk.git "$D"
   git -C "$D" submodule update -q --init --recursive --depth 1
-  git -C "$D" apply "$HERE"/patches-deps/dxvk-3.1.1-*.patch
 fi
+# patches added since the tree was cloned are applied too (one that is already in fails --check and is skipped)
+for p in "$HERE"/patches-deps/dxvk-3.1.1-*.patch; do
+  git -C "$D" apply --check "$p" 2>/dev/null && git -C "$D" apply "$p"
+done
 [ -d "$D/build.w64" ] || meson setup --cross-file "$D/build-win64.txt" --buildtype release --strip "$D/build.w64" "$D" >/dev/null
 ninja -C "$D/build.w64" src/d3d11/d3d11.dll >/dev/null
 x86_64-w64-mingw32-strip -o "$OUT/d3d11.dll" "$D/build.w64/src/d3d11/d3d11.dll"

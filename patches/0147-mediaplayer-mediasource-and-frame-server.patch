@@ -1,0 +1,3201 @@
+windows.media.playback.mediaplayer: MediaSource, AdaptiveMediaSource, MediaPlaybackItem and a frame-server MediaPlayer;
+mfmediaengine: TransferVideoFrame to a WIC bitmap reads bottom-up frames upright.
+
+Lightroom Classic's Help > What's New showed "Unable to play this video. It requires a component that isn't available
+for this computer" for its four videos (local H.264 files in %TEMP%, LrCHelp_*.mp4). video_toolkit.dll first activates
+Windows.Media.Core.MediaSource (IMediaSourceStatics) and Windows.Media.Streaming.Adaptive.AdaptiveMediaSource
+(IAdaptiveMediaSourceStatics, which it calls without checking that the factory exists, so it crashed once
+MediaSource was there). For a local file it then uses MediaSource.CreateFromUri and IMediaSource4, and plays the video
+with its own IMFMediaEngine in frame-server mode; it does not create a MediaPlayer.
+
+New in the DLL (media_private.idl: interface layouts from the Windows metadata, with IInspectable for types Wine does
+not declare):
+- MediaSource: CreateFromUri (keeps the absolute URI), IMediaSource2/3/4 (OpenAsync completes at once; the media engine
+  opens the file when it plays), IMediaPlaybackSource, IClosable.
+- AdaptiveMediaSource statics: IsContentTypeSupported answers FALSE; the async creators return E_NOTIMPL, so callers
+  fall back to MediaSource (HLS and DASH manifests are not supported).
+- MediaPlaybackItem (IMediaPlaybackItemFactory.Create).
+- MediaPlayer on IMFMediaEngine: Source (IMediaPlayerSource2) and SetUriSource, Play/Pause, AutoPlay, looping, mute,
+  volume, rate, position, duration; IMediaPlayer3's PlaybackSession (state, natural size and duration, position) and
+  events (MediaOpened/Ended/Failed, CurrentStateChanged, SourceChanged, PlaybackStateChanged...) raised from a worker
+  thread outside the engine's callbacks; IMediaPlayer5's frame server: VideoFrameAvailable while playing, and
+  CopyFrameToVideoSurface(WithTargetRectangle) takes the frame at native size into a WIC bitmap and scales it into the
+  target IDirect3DSurface's texture (via IDirect3DDxgiInterfaceAccess; BGRA/BGRX/RGBA).
+
+mfmediaengine: media_engine_transfer_wic copied the converter's output top-down, but its RGB32 samples are bottom-up
+(negative MF_MT_DEFAULT_STRIDE), so frames arrived upside down. It now reads rows as the window path of patch 0144
+does: a 2D buffer by its own pitch, a plain buffer by the sink type's default stride (bottom-up when it has none).
+
+Test: tests/mf/mfwinrt.c (MediaSource.CreateFromUri -> MediaPlaybackItem -> MediaPlayer frame server ->
+CopyFrameToVideoSurface into a 427x240 texture from mkvideo.sh's 854x480 layout.mp4): PASS, white top, red left, blue
+right (before: no MediaSource class; with the player but without the mfmediaengine part, upside down). Lightroom Classic
+(November 2026) What's New: the Glow and Blemish Removal videos play (before: the error above).
+
+diff --git a/dlls/windows.media.playback.mediaplayer/Makefile.in b/dlls/windows.media.playback.mediaplayer/Makefile.in
+index f37a609..fb274a2 100644
+--- a/dlls/windows.media.playback.mediaplayer/Makefile.in
++++ b/dlls/windows.media.playback.mediaplayer/Makefile.in
+@@ -1,6 +1,8 @@
+ MODULE  = windows.media.playback.mediaplayer.dll
+-IMPORTS = combase user32
++IMPORTS = combase user32 ole32 oleaut32 mfplat
+ 
+ SOURCES = \
+ 	classes.idl \
+-	main.c
++	main.c \
++	media_private.idl \
++	source.c
+diff --git a/dlls/windows.media.playback.mediaplayer/classes.idl b/dlls/windows.media.playback.mediaplayer/classes.idl
+index 5ad7ee4..35350fe 100644
+--- a/dlls/windows.media.playback.mediaplayer/classes.idl
++++ b/dlls/windows.media.playback.mediaplayer/classes.idl
+@@ -22,7 +22,17 @@
+ #pragma winrt ns_prefix
+ 
+ import "windows.media.playback.idl";
++import "media_private.idl";
++
++namespace Windows.Media.Core {
++    runtimeclass MediaSource;
++}
++
++namespace Windows.Media.Streaming.Adaptive {
++    runtimeclass AdaptiveMediaSource;
++}
+ 
+ namespace Windows.Media.Playback {
+     runtimeclass MediaPlayer;
++    runtimeclass MediaPlaybackItem;
+ }
+diff --git a/dlls/windows.media.playback.mediaplayer/main.c b/dlls/windows.media.playback.mediaplayer/main.c
+index 3c3c24d..be96541 100644
+--- a/dlls/windows.media.playback.mediaplayer/main.c
++++ b/dlls/windows.media.playback.mediaplayer/main.c
+@@ -24,14 +24,63 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mediaplayer);
+ 
++/* EXTERN_GUIDs in mfmediaengine.h, which initguid.h does not instantiate */
++DEFINE_GUID( clsid_media_engine_factory, 0xb44392da, 0x499b, 0x446b, 0xa4, 0xcb, 0x00, 0x5f, 0xea, 0xd0, 0xe6, 0xd5 );
++DEFINE_GUID( attr_engine_callback, 0xc60381b8, 0x83a4, 0x41f8, 0xa3, 0xd0, 0xde, 0x05, 0x07, 0x68, 0x49, 0xa9 );
++DEFINE_GUID( attr_engine_output_format, 0x5066893c, 0x8cf9, 0x42bc, 0x8b, 0x8a, 0x47, 0x22, 0x12, 0xe5, 0x27, 0x26 );
++
++enum player_event
++{
++    EVENT_OPENED,
++    EVENT_ENDED,
++    EVENT_FAILED,
++    EVENT_STATE,
++    EVENT_SOURCE_CHANGED,
++    EVENT_FRAME,
++    EVENT_SESSION_STATE,
++    EVENT_SESSION_DURATION,
++    EVENT_SESSION_SIZE,
++    EVENT_SESSION_POSITION,
++    EVENT_OTHER,
++    EVENT_COUNT
++};
++
+ struct media_player
+ {
+     IMediaPlayer IMediaPlayer_iface;
+     IMediaPlayer2 IMediaPlayer2_iface;
++    IMediaPlayer3 IMediaPlayer3_iface;
++    IMediaPlayer5 IMediaPlayer5_iface;
++    IMediaPlayerSource2 IMediaPlayerSource2_iface;
++    IMediaPlaybackSession IMediaPlaybackSession_iface;
++    IClosable IClosable_iface;
++    IMFMediaEngineNotify IMFMediaEngineNotify_iface;
+     LONG ref;
+ 
+     ISystemMediaTransportControls *controls;
+     HWND window;
++
++    CRITICAL_SECTION cs;
++    struct event_handlers events[EVENT_COUNT];
++    LONG pending;           /* EVENT_* bits the worker raises next */
++    HRESULT error;
++
++    IInspectable *source;
++    IMFMediaEngine *engine;
++    BOOL mf_started;
++    HANDLE thread, stop;
++    DWORD thread_id;
++
++    boolean autoplay, looping, muted, frame_server, opened;
++    DOUBLE volume, rate;
++    INT32 state;            /* MediaPlaybackState: None, Opening, Buffering, Playing, Paused */
++    TimeSpan offset;
++
++    IWICImagingFactory *wic;
++    IWICBitmap *bitmap;
++    UINT bitmap_width, bitmap_height;
++    BYTE *scaled;
++    SIZE_T scaled_size;
+ };
+ 
+ static inline struct media_player *impl_from_IMediaPlayer( IMediaPlayer *iface )
+@@ -39,330 +88,799 @@ static inline struct media_player *impl_from_IMediaPlayer( IMediaPlayer *iface )
+     return CONTAINING_RECORD( iface, struct media_player, IMediaPlayer_iface );
+ }
+ 
+-static HRESULT WINAPI media_player_QueryInterface( IMediaPlayer *iface, REFIID iid, void **out )
++static void player_raise( struct media_player *impl, enum player_event event )
+ {
+-    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    InterlockedOr( &impl->pending, 1 << event );
++}
+ 
+-    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++static void player_set_state( struct media_player *impl, INT32 state )
++{
++    if (impl->state == state) return;
++    TRACE( "player %p state %d -> %d.\n", impl, impl->state, state );
++    impl->state = state;
++    player_raise( impl, EVENT_STATE );
++    player_raise( impl, EVENT_SESSION_STATE );
++}
+ 
+-    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+-        IsEqualGUID( iid, &IID_IInspectable ) ||
+-        IsEqualGUID( iid, &IID_IAgileObject ) ||
+-        IsEqualGUID( iid, &IID_IMediaPlayer ))
+-    {
+-        *out = &impl->IMediaPlayer_iface;
+-        IInspectable_AddRef( *out );
+-        return S_OK;
+-    }
++/* MediaPlayerFailedEventArgs */
++
++struct failed_args
++{
++    IMediaPlayerFailedEventArgs IMediaPlayerFailedEventArgs_iface;
++    LONG ref;
++    HRESULT code;
++};
++
++static inline struct failed_args *impl_from_IMediaPlayerFailedEventArgs( IMediaPlayerFailedEventArgs *iface )
++{
++    return CONTAINING_RECORD( iface, struct failed_args, IMediaPlayerFailedEventArgs_iface );
++}
+ 
+-    if (IsEqualGUID( iid, &IID_IMediaPlayer2 ))
++static HRESULT WINAPI failed_args_QueryInterface( IMediaPlayerFailedEventArgs *iface, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMediaPlayerFailedEventArgs ))
+     {
+-        *out = &impl->IMediaPlayer2_iface;
+-        IInspectable_AddRef( *out );
++        IInspectable_AddRef( (*out = iface) );
+         return S_OK;
+     }
+-
+-    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+ }
+ 
+-static ULONG WINAPI media_player_AddRef( IMediaPlayer *iface )
++static ULONG WINAPI failed_args_AddRef( IMediaPlayerFailedEventArgs *iface )
+ {
+-    struct media_player *impl = impl_from_IMediaPlayer( iface );
+-    ULONG ref = InterlockedIncrement( &impl->ref );
+-    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
+-    return ref;
++    return InterlockedIncrement( &impl_from_IMediaPlayerFailedEventArgs( iface )->ref );
+ }
+ 
+-static ULONG WINAPI media_player_Release( IMediaPlayer *iface )
++static ULONG WINAPI failed_args_Release( IMediaPlayerFailedEventArgs *iface )
+ {
+-    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    struct failed_args *impl = impl_from_IMediaPlayerFailedEventArgs( iface );
+     ULONG ref = InterlockedDecrement( &impl->ref );
+-
+-    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
+-
+-    if (!ref)
+-    {
+-        ISystemMediaTransportControls_Release( impl->controls );
+-        DestroyWindow( impl->window );
+-        free( impl );
+-    }
++    if (!ref) free( impl );
+     return ref;
+ }
+ 
+-static HRESULT WINAPI media_player_GetIids( IMediaPlayer *iface, ULONG *iid_count, IID **iids )
++static HRESULT WINAPI failed_args_GetIids( IMediaPlayerFailedEventArgs *iface, ULONG *iid_count, IID **iids )
+ {
+-    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI media_player_GetRuntimeClassName( IMediaPlayer *iface, HSTRING *class_name )
++static HRESULT WINAPI failed_args_GetRuntimeClassName( IMediaPlayerFailedEventArgs *iface, HSTRING *class_name )
+ {
+-    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI media_player_GetTrustLevel( IMediaPlayer *iface, TrustLevel *trust_level )
++static HRESULT WINAPI failed_args_GetTrustLevel( IMediaPlayerFailedEventArgs *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
+-    return E_NOTIMPL;
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_get_AutoPlay( IMediaPlayer *iface, boolean *value )
++static HRESULT WINAPI failed_args_get_Error( IMediaPlayerFailedEventArgs *iface, MediaPlayerError *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct failed_args *impl = impl_from_IMediaPlayerFailedEventArgs( iface );
++    *value = impl->code == MF_E_UNSUPPORTED_BYTESTREAM_TYPE ? MediaPlayerError_SourceNotSupported : MediaPlayerError_DecodingError;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_put_AutoPlay( IMediaPlayer *iface, boolean value )
++static HRESULT WINAPI failed_args_get_ExtendedErrorCode( IMediaPlayerFailedEventArgs *iface, HRESULT *value )
+ {
+-    FIXME( "iface %p, value %d stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayerFailedEventArgs( iface )->code;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_get_NaturalDuration( IMediaPlayer *iface, TimeSpan *value )
++static HRESULT WINAPI failed_args_get_ErrorMessage( IMediaPlayerFailedEventArgs *iface, HSTRING *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = NULL;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_get_Position( IMediaPlayer *iface, TimeSpan *value )
++static const struct IMediaPlayerFailedEventArgsVtbl failed_args_vtbl =
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
+-}
++    failed_args_QueryInterface,
++    failed_args_AddRef,
++    failed_args_Release,
++    failed_args_GetIids,
++    failed_args_GetRuntimeClassName,
++    failed_args_GetTrustLevel,
++    failed_args_get_Error,
++    failed_args_get_ExtendedErrorCode,
++    failed_args_get_ErrorMessage,
++};
+ 
+-static HRESULT WINAPI media_player_put_Position( IMediaPlayer *iface, TimeSpan value )
++/* the worker raises the events (outside the media engine's callbacks, which hold its lock) and polls for new
++ * video frames while the frame server is on */
++static DWORD WINAPI player_thread( void *arg )
+ {
+-    FIXME( "iface %p, value %I64d stub!\n", iface, value.Duration );
+-    return E_NOTIMPL;
++    struct media_player *impl = arg;
++    IInspectable *player = (IInspectable *)&impl->IMediaPlayer_iface;
++    IInspectable *session = (IInspectable *)&impl->IMediaPlaybackSession_iface;
++    DWORD ticks = 0;
++
++    SetThreadDescription( GetCurrentThread(), L"wine_mediaplayer_worker" );
++
++    while (WaitForSingleObject( impl->stop, 10 ) == WAIT_TIMEOUT)
++    {
++        LONG pending = InterlockedExchange( &impl->pending, 0 );
++        LONGLONG pts;
++
++        if (pending & (1 << EVENT_SESSION_SIZE)) event_handlers_invoke( &impl->events[EVENT_SESSION_SIZE], &impl->cs, session, NULL );
++        if (pending & (1 << EVENT_SESSION_DURATION)) event_handlers_invoke( &impl->events[EVENT_SESSION_DURATION], &impl->cs, session, NULL );
++        if (pending & (1 << EVENT_SOURCE_CHANGED)) event_handlers_invoke( &impl->events[EVENT_SOURCE_CHANGED], &impl->cs, player, NULL );
++        if (pending & (1 << EVENT_OPENED)) event_handlers_invoke( &impl->events[EVENT_OPENED], &impl->cs, player, NULL );
++        if (pending & (1 << EVENT_SESSION_STATE)) event_handlers_invoke( &impl->events[EVENT_SESSION_STATE], &impl->cs, session, NULL );
++        if (pending & (1 << EVENT_STATE)) event_handlers_invoke( &impl->events[EVENT_STATE], &impl->cs, player, NULL );
++        if (pending & (1 << EVENT_ENDED)) event_handlers_invoke( &impl->events[EVENT_ENDED], &impl->cs, player, NULL );
++        if (pending & (1 << EVENT_FAILED))
++        {
++            struct failed_args *args;
++            if ((args = calloc( 1, sizeof(*args) )))
++            {
++                args->IMediaPlayerFailedEventArgs_iface.lpVtbl = &failed_args_vtbl;
++                args->ref = 1;
++                args->code = impl->error;
++                event_handlers_invoke( &impl->events[EVENT_FAILED], &impl->cs, player, (IInspectable *)&args->IMediaPlayerFailedEventArgs_iface );
++                IMediaPlayerFailedEventArgs_Release( &args->IMediaPlayerFailedEventArgs_iface );
++            }
++        }
++
++        if (!impl->engine || impl->state != 3) continue;
++        if (impl->frame_server && IMFMediaEngine_OnVideoStreamTick( impl->engine, &pts ) == S_OK)
++            event_handlers_invoke( &impl->events[EVENT_FRAME], &impl->cs, player, NULL );
++        if (!(++ticks % 25)) event_handlers_invoke( &impl->events[EVENT_SESSION_POSITION], &impl->cs, session, NULL );
++    }
++    return 0;
+ }
+ 
+-static HRESULT WINAPI media_player_get_BufferingProgress( IMediaPlayer *iface, DOUBLE *value )
++/* IMFMediaEngineNotify: the player owns the engine and shuts it down before it goes away */
++
++static inline struct media_player *impl_from_IMFMediaEngineNotify( IMFMediaEngineNotify *iface )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    return CONTAINING_RECORD( iface, struct media_player, IMFMediaEngineNotify_iface );
+ }
+ 
+-static HRESULT WINAPI media_player_get_CurrentState( IMediaPlayer *iface, MediaPlayerState *value )
++static HRESULT WINAPI engine_notify_QueryInterface( IMFMediaEngineNotify *iface, REFIID iid, void **out )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IMFMediaEngineNotify ))
++    {
++        *out = iface;
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
+ }
+ 
+-static HRESULT WINAPI media_player_get_CanSeek( IMediaPlayer *iface, boolean *value )
++static ULONG WINAPI engine_notify_AddRef( IMFMediaEngineNotify *iface )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    return 2;
+ }
+ 
+-static HRESULT WINAPI media_player_get_CanPause( IMediaPlayer *iface, boolean *value )
++static ULONG WINAPI engine_notify_Release( IMFMediaEngineNotify *iface )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    return 1;
+ }
+ 
+-static HRESULT WINAPI media_player_get_IsLoopingEnabled( IMediaPlayer *iface, boolean *value )
++static HRESULT WINAPI engine_notify_EventNotify( IMFMediaEngineNotify *iface, DWORD event, DWORD_PTR param1, DWORD param2 )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMFMediaEngineNotify( iface );
++
++    TRACE( "player %p, event %lu, param1 %#Ix, param2 %#lx.\n", impl, event, param1, param2 );
++
++    switch (event)
++    {
++    case MF_MEDIA_ENGINE_EVENT_LOADSTART:
++        player_set_state( impl, 1 );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
++        player_raise( impl, EVENT_SESSION_SIZE );
++        player_raise( impl, EVENT_SESSION_DURATION );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE:
++        player_raise( impl, EVENT_SESSION_DURATION );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_FORMATCHANGE:
++        player_raise( impl, EVENT_SESSION_SIZE );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_CANPLAY:
++        if (!impl->opened)
++        {
++            impl->opened = TRUE;
++            player_raise( impl, EVENT_OPENED );
++            if (impl->state == 1) player_set_state( impl, 4 );
++        }
++        break;
++    case MF_MEDIA_ENGINE_EVENT_PLAYING:
++        player_set_state( impl, 3 );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_PAUSE:
++        player_set_state( impl, 4 );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_WAITING:
++        player_set_state( impl, 2 );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_ENDED:
++        player_raise( impl, EVENT_ENDED );
++        if (!impl->looping) player_set_state( impl, 4 );
++        break;
++    case MF_MEDIA_ENGINE_EVENT_ERROR:
++        ERR( "media engine error %Iu, hr %#lx.\n", param1, param2 );
++        impl->error = param2 ? param2 : E_FAIL;
++        player_raise( impl, EVENT_FAILED );
++        player_set_state( impl, 0 );
++        break;
++    }
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_put_IsLoopingEnabled( IMediaPlayer *iface, boolean value )
++static const struct IMFMediaEngineNotifyVtbl engine_notify_vtbl =
+ {
+-    FIXME( "iface %p, value %d stub!\n", iface, value );
+-    return E_NOTIMPL;
+-}
++    engine_notify_QueryInterface,
++    engine_notify_AddRef,
++    engine_notify_Release,
++    engine_notify_EventNotify,
++};
+ 
+-static HRESULT WINAPI media_player_get_IsProtected( IMediaPlayer *iface, boolean *value )
++static void player_shutdown( struct media_player *impl )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    IMFMediaEngine *engine;
++
++    if (impl->thread)
++    {
++        SetEvent( impl->stop );
++        if (GetCurrentThreadId() != impl->thread_id) WaitForSingleObject( impl->thread, INFINITE );
++        CloseHandle( impl->thread );
++        impl->thread = NULL;
++    }
++    EnterCriticalSection( &impl->cs );
++    engine = impl->engine;
++    impl->engine = NULL;
++    LeaveCriticalSection( &impl->cs );
++    if (engine)
++    {
++        IMFMediaEngine_Shutdown( engine );
++        IMFMediaEngine_Release( engine );
++    }
+ }
+ 
+-static HRESULT WINAPI media_player_get_IsMuted( IMediaPlayer *iface, boolean *value )
++static HRESULT player_create_engine( struct media_player *impl )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    IMFMediaEngineClassFactory *factory;
++    IMFAttributes *attributes;
++    HRESULT hr;
++
++    if (impl->engine) return S_OK;
++
++    if (!impl->mf_started)
++    {
++        if (FAILED(hr = MFStartup( MF_VERSION, MFSTARTUP_FULL ))) return hr;
++        impl->mf_started = TRUE;
++    }
++    if (FAILED(hr = CoCreateInstance( &clsid_media_engine_factory, NULL, CLSCTX_INPROC_SERVER,
++                                      &IID_IMFMediaEngineClassFactory, (void **)&factory )))
++    {
++        ERR( "no media engine factory, hr %#lx.\n", hr );
++        return hr;
++    }
++    if (SUCCEEDED(hr = MFCreateAttributes( &attributes, 2 )))
++    {
++        IMFAttributes_SetUnknown( attributes, &attr_engine_callback, (IUnknown *)&impl->IMFMediaEngineNotify_iface );
++        IMFAttributes_SetUINT32( attributes, &attr_engine_output_format, DXGI_FORMAT_B8G8R8A8_UNORM );
++        hr = IMFMediaEngineClassFactory_CreateInstance( factory, 0, attributes, &impl->engine );
++        IMFAttributes_Release( attributes );
++    }
++    IMFMediaEngineClassFactory_Release( factory );
++    if (FAILED(hr))
++    {
++        ERR( "failed to create the media engine, hr %#lx.\n", hr );
++        return hr;
++    }
++
++    IMFMediaEngine_SetAutoPlay( impl->engine, impl->autoplay );
++    IMFMediaEngine_SetLoop( impl->engine, impl->looping );
++    IMFMediaEngine_SetMuted( impl->engine, impl->muted );
++    IMFMediaEngine_SetVolume( impl->engine, impl->volume );
++
++    if (!impl->stop) impl->stop = CreateEventW( NULL, TRUE, FALSE, NULL );
++    ResetEvent( impl->stop );
++    if (!(impl->thread = CreateThread( NULL, 0, player_thread, impl, 0, &impl->thread_id )))
++        return HRESULT_FROM_WIN32( GetLastError() );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_put_IsMuted( IMediaPlayer *iface, boolean value )
++static HRESULT player_set_source( struct media_player *impl, IInspectable *source )
+ {
+-    FIXME( "iface %p, value %d stub!\n", iface, value );
+-    return E_NOTIMPL;
++    HSTRING url = NULL;
++    BSTR bstr;
++    HRESULT hr;
++
++    if (source && FAILED(hr = media_source_get_url( source, &url ))) return hr;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->source) IInspectable_Release( impl->source );
++    if ((impl->source = source)) IInspectable_AddRef( source );
++    impl->opened = FALSE;
++    LeaveCriticalSection( &impl->cs );
++    player_raise( impl, EVENT_SOURCE_CHANGED );
++
++    if (!source)
++    {
++        player_shutdown( impl );
++        player_set_state( impl, 0 );
++        return S_OK;
++    }
++
++    TRACE( "player %p source %s.\n", impl, debugstr_hstring( url ) );
++    if (SUCCEEDED(hr = player_create_engine( impl )))
++    {
++        if (!(bstr = SysAllocString( WindowsGetStringRawBuffer( url, NULL ) ))) hr = E_OUTOFMEMORY;
++        else
++        {
++            player_set_state( impl, 1 );
++            hr = IMFMediaEngine_SetSource( impl->engine, bstr );
++            SysFreeString( bstr );
++        }
++    }
++    WindowsDeleteString( url );
++    if (FAILED(hr))
++    {
++        impl->error = hr;
++        player_raise( impl, EVENT_FAILED );
++    }
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_get_PlaybackRate( IMediaPlayer *iface, DOUBLE *value )
++static HRESULT player_copy_frame( struct media_player *impl, IDirect3DSurface *destination, const Rect *target )
++{
++    IDirect3DDxgiInterfaceAccess *access;
++    ID3D11DeviceContext *context;
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Multithread *mt;
++    ID3D11Texture2D *texture;
++    ID3D11Device *device;
++    UINT x, y, w, h, frame_width = 0, frame_height = 0, stride, size, swap;
++    WICRect wic_rect;
++    IWICBitmapLock *lock;
++    D3D11_BOX box;
++    RECT rect;
++    BYTE *data;
++    HRESULT hr;
++
++    if (!destination) return E_POINTER;
++    if (FAILED(hr = IDirect3DSurface_QueryInterface( destination, &IID_IDirect3DDxgiInterfaceAccess, (void **)&access ))) return hr;
++    hr = IDirect3DDxgiInterfaceAccess_GetInterface( access, &IID_ID3D11Texture2D, (void **)&texture );
++    IDirect3DDxgiInterfaceAccess_Release( access );
++    if (FAILED(hr)) return hr;
++
++    ID3D11Texture2D_GetDesc( texture, &desc );
++    switch (desc.Format)
++    {
++    case DXGI_FORMAT_B8G8R8A8_UNORM:
++    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++    case DXGI_FORMAT_B8G8R8X8_UNORM:
++    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
++        swap = 0;
++        break;
++    case DXGI_FORMAT_R8G8B8A8_UNORM:
++    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++        swap = 1;
++        break;
++    default:
++        FIXME( "unsupported destination format %#x.\n", desc.Format );
++        ID3D11Texture2D_Release( texture );
++        return E_INVALIDARG;
++    }
++
++    box.left = 0;
++    box.top = 0;
++    box.right = desc.Width;
++    box.bottom = desc.Height;
++    box.front = 0;
++    box.back = 1;
++    if (target)
++    {
++        box.left = min( max( target->X, 0 ), desc.Width );
++        box.top = min( max( target->Y, 0 ), desc.Height );
++        box.right = min( max( target->X + target->Width, box.left ), desc.Width );
++        box.bottom = min( max( target->Y + target->Height, box.top ), desc.Height );
++    }
++    w = box.right - box.left;
++    h = box.bottom - box.top;
++
++    EnterCriticalSection( &impl->cs );
++    if (!impl->engine) hr = MF_E_SHUTDOWN;
++    else if (FAILED(hr = IMFMediaEngine_GetNativeVideoSize( impl->engine, (DWORD *)&frame_width, (DWORD *)&frame_height ))
++             || !frame_width || !frame_height || !w || !h)
++        hr = FAILED(hr) ? hr : MF_E_INVALIDREQUEST;
++    else if (!impl->wic && FAILED(hr = CoCreateInstance( &CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
++                                                         &IID_IWICImagingFactory, (void **)&impl->wic )))
++        ERR( "no WIC factory, hr %#lx.\n", hr );
++    else
++    {
++        if (impl->bitmap && (impl->bitmap_width != frame_width || impl->bitmap_height != frame_height))
++        {
++            IWICBitmap_Release( impl->bitmap );
++            impl->bitmap = NULL;
++        }
++        if (!impl->bitmap && SUCCEEDED(hr = IWICImagingFactory_CreateBitmap( impl->wic, frame_width, frame_height,
++                &GUID_WICPixelFormat32bppBGRA, WICBitmapCacheOnLoad, &impl->bitmap )))
++        {
++            impl->bitmap_width = frame_width;
++            impl->bitmap_height = frame_height;
++        }
++        if (impl->scaled_size < (SIZE_T)w * h * 4)
++        {
++            free( impl->scaled );
++            impl->scaled_size = (SIZE_T)w * h * 4;
++            if (!(impl->scaled = malloc( impl->scaled_size ))) impl->scaled_size = 0;
++        }
++        if (!impl->scaled) hr = E_OUTOFMEMORY;
++    }
++    if (SUCCEEDED(hr))
++    {
++        SetRect( &rect, 0, 0, frame_width, frame_height );
++        hr = IMFMediaEngine_TransferVideoFrame( impl->engine, (IUnknown *)impl->bitmap, NULL, &rect, NULL );
++        if (FAILED(hr)) WARN( "TransferVideoFrame failed, hr %#lx.\n", hr );
++    }
++    if (SUCCEEDED(hr))
++    {
++        wic_rect.X = wic_rect.Y = 0;
++        wic_rect.Width = frame_width;
++        wic_rect.Height = frame_height;
++        if (SUCCEEDED(hr = IWICBitmap_Lock( impl->bitmap, &wic_rect, WICBitmapLockRead, &lock )))
++        {
++            if (SUCCEEDED(hr = IWICBitmapLock_GetStride( lock, &stride ))
++                && SUCCEEDED(hr = IWICBitmapLock_GetDataPointer( lock, &size, &data )))
++            {
++                for (y = 0; y < h; y++)
++                {
++                    const BYTE *row = data + (SIZE_T)(y * frame_height / h) * stride;
++                    BYTE *out = impl->scaled + (SIZE_T)y * w * 4;
++                    for (x = 0; x < w; x++, out += 4)
++                    {
++                        const BYTE *px = row + (x * frame_width / w) * 4;
++                        out[0] = px[swap ? 2 : 0];
++                        out[1] = px[1];
++                        out[2] = px[swap ? 0 : 2];
++                        out[3] = 0xff;
++                    }
++                }
++            }
++            IWICBitmapLock_Release( lock );
++        }
++    }
++    LeaveCriticalSection( &impl->cs );
++
++    if (SUCCEEDED(hr))
++    {
++        ID3D11Texture2D_GetDevice( texture, &device );
++        ID3D11Device_GetImmediateContext( device, &context );
++        if (FAILED(ID3D11DeviceContext_QueryInterface( context, &IID_ID3D11Multithread, (void **)&mt ))) mt = NULL;
++        if (mt) ID3D11Multithread_Enter( mt );
++        ID3D11DeviceContext_UpdateSubresource( context, (ID3D11Resource *)texture, 0, &box, impl->scaled, w * 4, 0 );
++        if (mt)
++        {
++            ID3D11Multithread_Leave( mt );
++            ID3D11Multithread_Release( mt );
++        }
++        ID3D11DeviceContext_Release( context );
++        ID3D11Device_Release( device );
++    }
++    ID3D11Texture2D_Release( texture );
++    return hr;
++}
++
++static HRESULT WINAPI media_player_QueryInterface( IMediaPlayer *iface, REFIID iid, void **out )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IMediaPlayer ))
++        *out = &impl->IMediaPlayer_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlayer2 ))
++        *out = &impl->IMediaPlayer2_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlayer3 ))
++        *out = &impl->IMediaPlayer3_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlayer5 ))
++        *out = &impl->IMediaPlayer5_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlayerSource2 ))
++        *out = &impl->IMediaPlayerSource2_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlaybackSession ))
++        *out = &impl->IMediaPlaybackSession_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &impl->IClosable_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_put_PlaybackRate( IMediaPlayer *iface, DOUBLE value )
++static ULONG WINAPI media_player_AddRef( IMediaPlayer *iface )
+ {
+-    FIXME( "iface %p, value %lf stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
+ }
+ 
+-static HRESULT WINAPI media_player_get_Volume( IMediaPlayer *iface, DOUBLE *value )
++static ULONG WINAPI media_player_Release( IMediaPlayer *iface )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    UINT i;
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        player_shutdown( impl );
++        for (i = 0; i < EVENT_COUNT; i++) event_handlers_clear( &impl->events[i] );
++        if (impl->source) IInspectable_Release( impl->source );
++        if (impl->bitmap) IWICBitmap_Release( impl->bitmap );
++        if (impl->wic) IWICImagingFactory_Release( impl->wic );
++        if (impl->mf_started) MFShutdown();
++        if (impl->stop) CloseHandle( impl->stop );
++        free( impl->scaled );
++        ISystemMediaTransportControls_Release( impl->controls );
++        DestroyWindow( impl->window );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
++        free( impl );
++    }
++    return ref;
+ }
+ 
+-static HRESULT WINAPI media_player_put_Volume( IMediaPlayer *iface, DOUBLE value )
++static HRESULT WINAPI media_player_GetIids( IMediaPlayer *iface, ULONG *iid_count, IID **iids )
+ {
+-    FIXME( "iface %p, value %lf stub!\n", iface, value );
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT WINAPI media_player_get_PlaybackMediaMarkers( IMediaPlayer *iface, IPlaybackMediaMarkerSequence **value )
++static HRESULT WINAPI media_player_GetRuntimeClassName( IMediaPlayer *iface, HSTRING *class_name )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Media_Playback_MediaPlayer,
++                                wcslen( RuntimeClass_Windows_Media_Playback_MediaPlayer ), class_name );
+ }
+ 
+-static HRESULT WINAPI media_player_add_MediaOpened( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
++static HRESULT WINAPI media_player_GetTrustLevel( IMediaPlayer *iface, TrustLevel *trust_level )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    *trust_level = BaseTrust;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_MediaOpened( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_AutoPlay( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->autoplay;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_MediaEnded( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
++static HRESULT WINAPI media_player_put_AutoPlay( IMediaPlayer *iface, boolean value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl->autoplay = value;
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) IMFMediaEngine_SetAutoPlay( impl->engine, value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_MediaEnded( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_NaturalDuration( IMediaPlayer *iface, TimeSpan *value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    double duration = 0;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) duration = IMFMediaEngine_GetDuration( impl->engine );
++    LeaveCriticalSection( &impl->cs );
++    value->Duration = (duration > 0 && duration < 1e9) ? (INT64)(duration * 10000000) : 0;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_MediaFailed( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_MediaPlayerFailedEventArgs *value,
+-                                                    EventRegistrationToken *token )
++static HRESULT WINAPI media_player_get_Position( IMediaPlayer *iface, TimeSpan *value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    double time = 0;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) time = IMFMediaEngine_GetCurrentTime( impl->engine );
++    LeaveCriticalSection( &impl->cs );
++    value->Duration = time > 0 ? (INT64)(time * 10000000) : 0;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_MediaFailed( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_put_Position( IMediaPlayer *iface, TimeSpan value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, value %I64d.\n", iface, value.Duration );
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) hr = IMFMediaEngine_SetCurrentTime( impl->engine, value.Duration / 10000000.0 );
++    LeaveCriticalSection( &impl->cs );
++    return hr;
+ }
+ 
+-static HRESULT WINAPI media_player_add_CurrentStateChanged( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value,
+-                                                            EventRegistrationToken *token )
++static HRESULT WINAPI media_player_get_BufferingProgress( IMediaPlayer *iface, DOUBLE *value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    *value = 1.0;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_CurrentStateChanged( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_CurrentState( IMediaPlayer *iface, MediaPlayerState *value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->state;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_PlaybackMediaMarkerReached( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_PlaybackMediaMarkerReachedEventArgs *value,
+-                                                                   EventRegistrationToken *token )
++static HRESULT WINAPI media_player_get_CanSeek( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->opened;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_PlaybackMediaMarkerReached( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_CanPause( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    *value = TRUE;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_MediaPlayerRateChanged( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_MediaPlayerRateChangedEventArgs *value,
+-                                                               EventRegistrationToken *token )
++static HRESULT WINAPI media_player_get_IsLoopingEnabled( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->looping;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_MediaPlayerRateChanged( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_put_IsLoopingEnabled( IMediaPlayer *iface, boolean value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl->looping = value;
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) IMFMediaEngine_SetLoop( impl->engine, value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_VolumeChanged( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
++static HRESULT WINAPI media_player_get_IsProtected( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_VolumeChanged( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_IsMuted( IMediaPlayer *iface, boolean *value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->muted;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_SeekCompleted( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
++static HRESULT WINAPI media_player_put_IsMuted( IMediaPlayer *iface, boolean value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl->muted = value;
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) IMFMediaEngine_SetMuted( impl->engine, value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_SeekCompleted( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_PlaybackRate( IMediaPlayer *iface, DOUBLE *value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->rate;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_BufferingStarted( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
++static HRESULT WINAPI media_player_put_PlaybackRate( IMediaPlayer *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    TRACE( "iface %p, value %lf.\n", iface, value );
++    impl->rate = value;
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) IMFMediaEngine_SetPlaybackRate( impl->engine, value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_BufferingStarted( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_Volume( IMediaPlayer *iface, DOUBLE *value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    *value = impl_from_IMediaPlayer( iface )->volume;
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_add_BufferingEnded( IMediaPlayer *iface, ITypedEventHandler_MediaPlayer_IInspectable *value, EventRegistrationToken *token )
++static HRESULT WINAPI media_player_put_Volume( IMediaPlayer *iface, DOUBLE value )
+ {
+-    FIXME( "iface %p, value %p, token %p stub!\n", iface, value, token );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    TRACE( "iface %p, value %lf.\n", iface, value );
++    impl->volume = value;
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) IMFMediaEngine_SetVolume( impl->engine, value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
+ }
+ 
+-static HRESULT WINAPI media_player_remove_BufferingEnded( IMediaPlayer *iface, EventRegistrationToken token )
++static HRESULT WINAPI media_player_get_PlaybackMediaMarkers( IMediaPlayer *iface, IPlaybackMediaMarkerSequence **value )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
++    FIXME( "iface %p, value %p stub!\n", iface, value );
+     return E_NOTIMPL;
+ }
+ 
++#define PLAYER_EVENT( name, type, id )                                                               \
++    static HRESULT WINAPI media_player_add_##name( IMediaPlayer *iface, type *handler, EventRegistrationToken *token ) \
++    {                                                                                                \
++        struct media_player *impl = impl_from_IMediaPlayer( iface );                                 \
++        TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );                         \
++        return event_handlers_add( &impl->events[id], &impl->cs, (IUnknown *)handler, token );       \
++    }                                                                                                \
++    static HRESULT WINAPI media_player_remove_##name( IMediaPlayer *iface, EventRegistrationToken token ) \
++    {                                                                                                \
++        struct media_player *impl = impl_from_IMediaPlayer( iface );                                 \
++        TRACE( "iface %p, token %#I64x.\n", iface, token.value );                                    \
++        return event_handlers_remove( &impl->events[id], &impl->cs, token );                         \
++    }
++
++PLAYER_EVENT( MediaOpened, ITypedEventHandler_MediaPlayer_IInspectable, EVENT_OPENED )
++PLAYER_EVENT( MediaEnded, ITypedEventHandler_MediaPlayer_IInspectable, EVENT_ENDED )
++PLAYER_EVENT( MediaFailed, ITypedEventHandler_MediaPlayer_MediaPlayerFailedEventArgs, EVENT_FAILED )
++PLAYER_EVENT( CurrentStateChanged, ITypedEventHandler_MediaPlayer_IInspectable, EVENT_STATE )
++PLAYER_EVENT( PlaybackMediaMarkerReached, ITypedEventHandler_MediaPlayer_PlaybackMediaMarkerReachedEventArgs, EVENT_OTHER )
++PLAYER_EVENT( MediaPlayerRateChanged, ITypedEventHandler_MediaPlayer_MediaPlayerRateChangedEventArgs, EVENT_OTHER )
++PLAYER_EVENT( VolumeChanged, ITypedEventHandler_MediaPlayer_IInspectable, EVENT_OTHER )
++PLAYER_EVENT( SeekCompleted, ITypedEventHandler_MediaPlayer_IInspectable, EVENT_OTHER )
++PLAYER_EVENT( BufferingStarted, ITypedEventHandler_MediaPlayer_IInspectable, EVENT_OTHER )
++PLAYER_EVENT( BufferingEnded, ITypedEventHandler_MediaPlayer_IInspectable, EVENT_OTHER )
++
+ static HRESULT WINAPI media_player_Play( IMediaPlayer *iface )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p.\n", iface );
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) hr = IMFMediaEngine_Play( impl->engine );
++    LeaveCriticalSection( &impl->cs );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI media_player_Pause( IMediaPlayer *iface )
+ {
+-    FIXME( "iface %p stub!\n", iface );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p.\n", iface );
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) hr = IMFMediaEngine_Pause( impl->engine );
++    LeaveCriticalSection( &impl->cs );
++    return hr;
+ }
+ 
+ static HRESULT WINAPI media_player_SetUriSource( IMediaPlayer *iface, IUriRuntimeClass *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    struct media_player *impl = impl_from_IMediaPlayer( iface );
++    IInspectable *source = NULL;
++    HSTRING url;
++    HRESULT hr;
++
++    TRACE( "iface %p, value %p.\n", iface, value );
++
++    if (!value) return player_set_source( impl, NULL );
++    if (FAILED(hr = IUriRuntimeClass_get_AbsoluteUri( value, &url ))) return hr;
++    hr = media_source_create_from_url( url, &source );
++    WindowsDeleteString( url );
++    if (FAILED(hr)) return hr;
++    hr = player_set_source( impl, source );
++    IInspectable_Release( source );
++    return hr;
+ }
+ 
+ static const struct IMediaPlayerVtbl media_player_vtbl =
+@@ -435,26 +953,26 @@ static HRESULT WINAPI media_player2_get_SystemMediaTransportControls( IMediaPlay
+ 
+ static HRESULT WINAPI media_player2_get_AudioCategory( IMediaPlayer2 *iface, MediaPlayerAudioCategory *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = MediaPlayerAudioCategory_Other;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player2_put_AudioCategory( IMediaPlayer2 *iface, MediaPlayerAudioCategory value )
+ {
+-    FIXME( "iface %p, value %#x stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %#x.\n", iface, value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player2_get_AudioDeviceType( IMediaPlayer2 *iface, MediaPlayerAudioDeviceType *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    *value = MediaPlayerAudioDeviceType_Console;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI media_player2_put_AudioDeviceType( IMediaPlayer2 *iface, MediaPlayerAudioDeviceType value )
+ {
+-    FIXME( "iface %p, value %#x stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %#x.\n", iface, value );
++    return S_OK;
+ }
+ 
+ static const struct IMediaPlayer2Vtbl media_player2_vtbl =
+@@ -475,6 +993,463 @@ static const struct IMediaPlayer2Vtbl media_player2_vtbl =
+     media_player2_put_AudioDeviceType,
+ };
+ 
++DEFINE_IINSPECTABLE( media_player3, IMediaPlayer3, struct media_player, IMediaPlayer_iface )
++
++#define PLAYER3_EVENT( name, id )                                                                     \
++    static HRESULT WINAPI media_player3_add_##name( IMediaPlayer3 *iface, IUnknown *handler, EventRegistrationToken *token ) \
++    {                                                                                                \
++        struct media_player *impl = impl_from_IMediaPlayer3( iface );                                \
++        TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );                         \
++        return event_handlers_add( &impl->events[id], &impl->cs, handler, token );                   \
++    }                                                                                                \
++    static HRESULT WINAPI media_player3_remove_##name( IMediaPlayer3 *iface, EventRegistrationToken token ) \
++    {                                                                                                \
++        struct media_player *impl = impl_from_IMediaPlayer3( iface );                                \
++        return event_handlers_remove( &impl->events[id], &impl->cs, token );                         \
++    }
++
++PLAYER3_EVENT( IsMutedChanged, EVENT_OTHER )
++PLAYER3_EVENT( SourceChanged, EVENT_SOURCE_CHANGED )
++
++static HRESULT WINAPI media_player3_get_AudioBalance( IMediaPlayer3 *iface, DOUBLE *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_put_AudioBalance( IMediaPlayer3 *iface, DOUBLE value )
++{
++    TRACE( "iface %p, value %lf.\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_get_RealTimePlayback( IMediaPlayer3 *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_put_RealTimePlayback( IMediaPlayer3 *iface, boolean value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_get_StereoscopicVideoRenderMode( IMediaPlayer3 *iface, INT32 *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_put_StereoscopicVideoRenderMode( IMediaPlayer3 *iface, INT32 value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_get_unsupported( IMediaPlayer3 *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI media_player3_put_unsupported( IMediaPlayer3 *iface, IInspectable *value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI media_player3_get_TimelineControllerPositionOffset( IMediaPlayer3 *iface, TimeSpan *value )
++{
++    *value = impl_from_IMediaPlayer3( iface )->offset;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_put_TimelineControllerPositionOffset( IMediaPlayer3 *iface, TimeSpan value )
++{
++    impl_from_IMediaPlayer3( iface )->offset = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_get_PlaybackSession( IMediaPlayer3 *iface, IInspectable **value )
++{
++    struct media_player *impl = impl_from_IMediaPlayer3( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = (IInspectable *)&impl->IMediaPlaybackSession_iface;
++    IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player3_StepForwardOneFrame( IMediaPlayer3 *iface )
++{
++    struct media_player *impl = impl_from_IMediaPlayer3( iface );
++    IMFMediaEngineEx *ex;
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine && SUCCEEDED(IMFMediaEngine_QueryInterface( impl->engine, &IID_IMFMediaEngineEx, (void **)&ex )))
++    {
++        hr = IMFMediaEngineEx_FrameStep( ex, TRUE );
++        IMFMediaEngineEx_Release( ex );
++    }
++    LeaveCriticalSection( &impl->cs );
++    return hr;
++}
++
++static HRESULT WINAPI media_player3_StepBackwardOneFrame( IMediaPlayer3 *iface )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI media_player3_GetAsCastingSource( IMediaPlayer3 *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IMediaPlayer3Vtbl media_player3_vtbl =
++{
++    media_player3_QueryInterface,
++    media_player3_AddRef,
++    media_player3_Release,
++    media_player3_GetIids,
++    media_player3_GetRuntimeClassName,
++    media_player3_GetTrustLevel,
++    media_player3_add_IsMutedChanged,
++    media_player3_remove_IsMutedChanged,
++    media_player3_add_SourceChanged,
++    media_player3_remove_SourceChanged,
++    media_player3_get_AudioBalance,
++    media_player3_put_AudioBalance,
++    media_player3_get_RealTimePlayback,
++    media_player3_put_RealTimePlayback,
++    media_player3_get_StereoscopicVideoRenderMode,
++    media_player3_put_StereoscopicVideoRenderMode,
++    media_player3_get_unsupported,          /* BreakManager */
++    media_player3_get_unsupported,          /* CommandManager */
++    media_player3_get_unsupported,          /* AudioDevice */
++    media_player3_put_unsupported,
++    media_player3_get_unsupported,          /* TimelineController */
++    media_player3_put_unsupported,
++    media_player3_get_TimelineControllerPositionOffset,
++    media_player3_put_TimelineControllerPositionOffset,
++    media_player3_get_PlaybackSession,
++    media_player3_StepForwardOneFrame,
++    media_player3_StepBackwardOneFrame,
++    media_player3_GetAsCastingSource,
++};
++
++DEFINE_IINSPECTABLE( media_player5, IMediaPlayer5, struct media_player, IMediaPlayer_iface )
++
++static HRESULT WINAPI media_player5_add_VideoFrameAvailable( IMediaPlayer5 *iface, IUnknown *handler, EventRegistrationToken *token )
++{
++    struct media_player *impl = impl_from_IMediaPlayer5( iface );
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    return event_handlers_add( &impl->events[EVENT_FRAME], &impl->cs, handler, token );
++}
++
++static HRESULT WINAPI media_player5_remove_VideoFrameAvailable( IMediaPlayer5 *iface, EventRegistrationToken token )
++{
++    struct media_player *impl = impl_from_IMediaPlayer5( iface );
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return event_handlers_remove( &impl->events[EVENT_FRAME], &impl->cs, token );
++}
++
++static HRESULT WINAPI media_player5_get_IsVideoFrameServerEnabled( IMediaPlayer5 *iface, boolean *value )
++{
++    *value = impl_from_IMediaPlayer5( iface )->frame_server;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player5_put_IsVideoFrameServerEnabled( IMediaPlayer5 *iface, boolean value )
++{
++    TRACE( "iface %p, value %d.\n", iface, value );
++    impl_from_IMediaPlayer5( iface )->frame_server = value;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player5_CopyFrameToVideoSurface( IMediaPlayer5 *iface, IDirect3DSurface *destination )
++{
++    TRACE( "iface %p, destination %p.\n", iface, destination );
++    return player_copy_frame( impl_from_IMediaPlayer5( iface ), destination, NULL );
++}
++
++static HRESULT WINAPI media_player5_CopyFrameToVideoSurfaceWithTargetRectangle( IMediaPlayer5 *iface, IDirect3DSurface *destination, Rect rect )
++{
++    TRACE( "iface %p, destination %p, rect (%f,%f %fx%f).\n", iface, destination, rect.X, rect.Y, rect.Width, rect.Height );
++    return player_copy_frame( impl_from_IMediaPlayer5( iface ), destination, &rect );
++}
++
++static HRESULT WINAPI media_player5_CopyFrameToStereoscopicVideoSurfaces( IMediaPlayer5 *iface, IDirect3DSurface *left, IDirect3DSurface *right )
++{
++    HRESULT hr;
++    TRACE( "iface %p, left %p, right %p.\n", iface, left, right );
++    if (FAILED(hr = player_copy_frame( impl_from_IMediaPlayer5( iface ), left, NULL ))) return hr;
++    return player_copy_frame( impl_from_IMediaPlayer5( iface ), right, NULL );
++}
++
++static const struct IMediaPlayer5Vtbl media_player5_vtbl =
++{
++    media_player5_QueryInterface,
++    media_player5_AddRef,
++    media_player5_Release,
++    media_player5_GetIids,
++    media_player5_GetRuntimeClassName,
++    media_player5_GetTrustLevel,
++    media_player5_add_VideoFrameAvailable,
++    media_player5_remove_VideoFrameAvailable,
++    media_player5_get_IsVideoFrameServerEnabled,
++    media_player5_put_IsVideoFrameServerEnabled,
++    media_player5_CopyFrameToVideoSurface,
++    media_player5_CopyFrameToVideoSurfaceWithTargetRectangle,
++    media_player5_CopyFrameToStereoscopicVideoSurfaces,
++};
++
++DEFINE_IINSPECTABLE( media_player_source2, IMediaPlayerSource2, struct media_player, IMediaPlayer_iface )
++
++static HRESULT WINAPI media_player_source2_get_Source( IMediaPlayerSource2 *iface, IInspectable **value )
++{
++    struct media_player *impl = impl_from_IMediaPlayerSource2( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    EnterCriticalSection( &impl->cs );
++    if ((*value = impl->source)) IInspectable_AddRef( *value );
++    LeaveCriticalSection( &impl->cs );
++    return S_OK;
++}
++
++static HRESULT WINAPI media_player_source2_put_Source( IMediaPlayerSource2 *iface, IInspectable *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return player_set_source( impl_from_IMediaPlayerSource2( iface ), value );
++}
++
++static const struct IMediaPlayerSource2Vtbl media_player_source2_vtbl =
++{
++    media_player_source2_QueryInterface,
++    media_player_source2_AddRef,
++    media_player_source2_Release,
++    media_player_source2_GetIids,
++    media_player_source2_GetRuntimeClassName,
++    media_player_source2_GetTrustLevel,
++    media_player_source2_get_Source,
++    media_player_source2_put_Source,
++};
++
++DEFINE_IINSPECTABLE( media_player_closable, IClosable, struct media_player, IMediaPlayer_iface )
++
++static HRESULT WINAPI media_player_closable_Close( IClosable *iface )
++{
++    struct media_player *impl = impl_from_IClosable( iface );
++    TRACE( "iface %p.\n", iface );
++    player_shutdown( impl );
++    return S_OK;
++}
++
++static const struct IClosableVtbl media_player_closable_vtbl =
++{
++    media_player_closable_QueryInterface,
++    media_player_closable_AddRef,
++    media_player_closable_Release,
++    media_player_closable_GetIids,
++    media_player_closable_GetRuntimeClassName,
++    media_player_closable_GetTrustLevel,
++    media_player_closable_Close,
++};
++
++/* MediaPlaybackSession (one per player, shares its lifetime) */
++
++DEFINE_IINSPECTABLE( session, IMediaPlaybackSession, struct media_player, IMediaPlayer_iface )
++
++#define SESSION_EVENT( name, id )                                                                     \
++    static HRESULT WINAPI session_add_##name( IMediaPlaybackSession *iface, IUnknown *handler, EventRegistrationToken *token ) \
++    {                                                                                                \
++        struct media_player *impl = impl_from_IMediaPlaybackSession( iface );                        \
++        TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );                         \
++        return event_handlers_add( &impl->events[id], &impl->cs, handler, token );                   \
++    }                                                                                                \
++    static HRESULT WINAPI session_remove_##name( IMediaPlaybackSession *iface, EventRegistrationToken token ) \
++    {                                                                                                \
++        struct media_player *impl = impl_from_IMediaPlaybackSession( iface );                        \
++        return event_handlers_remove( &impl->events[id], &impl->cs, token );                         \
++    }
++
++SESSION_EVENT( PlaybackStateChanged, EVENT_SESSION_STATE )
++SESSION_EVENT( PlaybackRateChanged, EVENT_OTHER )
++SESSION_EVENT( SeekCompleted, EVENT_OTHER )
++SESSION_EVENT( BufferingStarted, EVENT_OTHER )
++SESSION_EVENT( BufferingEnded, EVENT_OTHER )
++SESSION_EVENT( BufferingProgressChanged, EVENT_OTHER )
++SESSION_EVENT( DownloadProgressChanged, EVENT_OTHER )
++SESSION_EVENT( NaturalDurationChanged, EVENT_SESSION_DURATION )
++SESSION_EVENT( PositionChanged, EVENT_SESSION_POSITION )
++SESSION_EVENT( NaturalVideoSizeChanged, EVENT_SESSION_SIZE )
++
++static HRESULT WINAPI session_get_MediaPlayer( IMediaPlaybackSession *iface, IMediaPlayer **value )
++{
++    struct media_player *impl = impl_from_IMediaPlaybackSession( iface );
++    *value = &impl->IMediaPlayer_iface;
++    IMediaPlayer_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_NaturalDuration( IMediaPlaybackSession *iface, TimeSpan *value )
++{
++    return media_player_get_NaturalDuration( &impl_from_IMediaPlaybackSession( iface )->IMediaPlayer_iface, value );
++}
++
++static HRESULT WINAPI session_get_Position( IMediaPlaybackSession *iface, TimeSpan *value )
++{
++    return media_player_get_Position( &impl_from_IMediaPlaybackSession( iface )->IMediaPlayer_iface, value );
++}
++
++static HRESULT WINAPI session_put_Position( IMediaPlaybackSession *iface, TimeSpan value )
++{
++    return media_player_put_Position( &impl_from_IMediaPlaybackSession( iface )->IMediaPlayer_iface, value );
++}
++
++static HRESULT WINAPI session_get_PlaybackState( IMediaPlaybackSession *iface, INT32 *value )
++{
++    *value = impl_from_IMediaPlaybackSession( iface )->state;
++    TRACE( "iface %p, state %d.\n", iface, *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_CanSeek( IMediaPlaybackSession *iface, boolean *value )
++{
++    *value = impl_from_IMediaPlaybackSession( iface )->opened;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_CanPause( IMediaPlaybackSession *iface, boolean *value )
++{
++    *value = TRUE;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_IsProtected( IMediaPlaybackSession *iface, boolean *value )
++{
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_PlaybackRate( IMediaPlaybackSession *iface, DOUBLE *value )
++{
++    *value = impl_from_IMediaPlaybackSession( iface )->rate;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_put_PlaybackRate( IMediaPlaybackSession *iface, DOUBLE value )
++{
++    return media_player_put_PlaybackRate( &impl_from_IMediaPlaybackSession( iface )->IMediaPlayer_iface, value );
++}
++
++static HRESULT WINAPI session_get_progress( IMediaPlaybackSession *iface, DOUBLE *value )
++{
++    *value = 1.0;
++    return S_OK;
++}
++
++static HRESULT session_get_video_size( struct media_player *impl, UINT32 *width, UINT32 *height )
++{
++    DWORD w = 0, h = 0;
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->engine) IMFMediaEngine_GetNativeVideoSize( impl->engine, &w, &h );
++    LeaveCriticalSection( &impl->cs );
++    if (width) *width = w;
++    if (height) *height = h;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_NaturalVideoHeight( IMediaPlaybackSession *iface, UINT32 *value )
++{
++    session_get_video_size( impl_from_IMediaPlaybackSession( iface ), NULL, value );
++    TRACE( "iface %p, height %u.\n", iface, *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_NaturalVideoWidth( IMediaPlaybackSession *iface, UINT32 *value )
++{
++    session_get_video_size( impl_from_IMediaPlaybackSession( iface ), value, NULL );
++    TRACE( "iface %p, width %u.\n", iface, *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_NormalizedSourceRect( IMediaPlaybackSession *iface, Rect *value )
++{
++    value->X = value->Y = 0;
++    value->Width = value->Height = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_put_NormalizedSourceRect( IMediaPlaybackSession *iface, Rect value )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return S_OK;
++}
++
++static HRESULT WINAPI session_get_StereoscopicVideoPackingMode( IMediaPlaybackSession *iface, INT32 *value )
++{
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI session_put_StereoscopicVideoPackingMode( IMediaPlaybackSession *iface, INT32 value )
++{
++    return S_OK;
++}
++
++static const struct IMediaPlaybackSessionVtbl session_vtbl =
++{
++    session_QueryInterface,
++    session_AddRef,
++    session_Release,
++    session_GetIids,
++    session_GetRuntimeClassName,
++    session_GetTrustLevel,
++    session_add_PlaybackStateChanged,
++    session_remove_PlaybackStateChanged,
++    session_add_PlaybackRateChanged,
++    session_remove_PlaybackRateChanged,
++    session_add_SeekCompleted,
++    session_remove_SeekCompleted,
++    session_add_BufferingStarted,
++    session_remove_BufferingStarted,
++    session_add_BufferingEnded,
++    session_remove_BufferingEnded,
++    session_add_BufferingProgressChanged,
++    session_remove_BufferingProgressChanged,
++    session_add_DownloadProgressChanged,
++    session_remove_DownloadProgressChanged,
++    session_add_NaturalDurationChanged,
++    session_remove_NaturalDurationChanged,
++    session_add_PositionChanged,
++    session_remove_PositionChanged,
++    session_add_NaturalVideoSizeChanged,
++    session_remove_NaturalVideoSizeChanged,
++    session_get_MediaPlayer,
++    session_get_NaturalDuration,
++    session_get_Position,
++    session_put_Position,
++    session_get_PlaybackState,
++    session_get_CanSeek,
++    session_get_CanPause,
++    session_get_IsProtected,
++    session_get_PlaybackRate,
++    session_put_PlaybackRate,
++    session_get_progress,                   /* BufferingProgress */
++    session_get_progress,                   /* DownloadProgress */
++    session_get_NaturalVideoHeight,
++    session_get_NaturalVideoWidth,
++    session_get_NormalizedSourceRect,
++    session_put_NormalizedSourceRect,
++    session_get_StereoscopicVideoPackingMode,
++    session_put_StereoscopicVideoPackingMode,
++};
++
+ struct media_player_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+@@ -590,7 +1565,18 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
+ 
+     impl->IMediaPlayer_iface.lpVtbl = &media_player_vtbl;
+     impl->IMediaPlayer2_iface.lpVtbl = &media_player2_vtbl;
++    impl->IMediaPlayer3_iface.lpVtbl = &media_player3_vtbl;
++    impl->IMediaPlayer5_iface.lpVtbl = &media_player5_vtbl;
++    impl->IMediaPlayerSource2_iface.lpVtbl = &media_player_source2_vtbl;
++    impl->IMediaPlaybackSession_iface.lpVtbl = &session_vtbl;
++    impl->IClosable_iface.lpVtbl = &media_player_closable_vtbl;
++    impl->IMFMediaEngineNotify_iface.lpVtbl = &engine_notify_vtbl;
+     impl->ref = 1;
++    impl->autoplay = TRUE;
++    impl->volume = 1.0;
++    impl->rate = 1.0;
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": media_player.cs");
+ 
+     *instance = (IInspectable *)&impl->IMediaPlayer_iface;
+     return S_OK;
+@@ -634,6 +1620,12 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+     if (!wcscmp( buffer, RuntimeClass_Windows_Media_Playback_MediaPlayer ))
+         IActivationFactory_QueryInterface( media_player_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Media_Core_MediaSource ))
++        IActivationFactory_QueryInterface( media_source_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Media_Streaming_Adaptive_AdaptiveMediaSource ))
++        IActivationFactory_QueryInterface( adaptive_source_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Media_Playback_MediaPlaybackItem ))
++        IActivationFactory_QueryInterface( playback_item_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/windows.media.playback.mediaplayer/media_private.idl b/dlls/windows.media.playback.mediaplayer/media_private.idl
+new file mode 100644
+index 0000000..870c302
+--- /dev/null
++++ b/dlls/windows.media.playback.mediaplayer/media_private.idl
+@@ -0,0 +1,236 @@
++/*
++ * Windows.Media.Core.MediaSource, MediaPlaybackItem and the MediaPlayer frame-server interfaces
++ * (LinDobe; layouts from the Windows metadata). Parameters whose types Wine does not declare are
++ * IInspectable or IUnknown (delegates); the slot order is what matters.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma makedep header
++#pragma winrt ns_prefix
++
++import "inspectable.idl";
++import "windows.foundation.idl";
++import "windows.media.core.idl";
++import "windows.media.playback.idl";
++import "windows.graphics.directx.direct3d11.idl";
++
++namespace Windows.Media.Core {
++    runtimeclass MediaSource;
++
++    [uuid(2eb61048-655f-4c37-b813-b4e45dfa0abe)]
++    interface IMediaSource2 : IInspectable
++    {
++        HRESULT add_OpenOperationCompleted([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_OpenOperationCompleted([in] EventRegistrationToken token);
++        HRESULT get_CustomProperties([out, retval] IInspectable **value);
++        HRESULT get_Duration([out, retval] IInspectable **value);
++        HRESULT get_IsOpen([out, retval] boolean *value);
++        HRESULT get_ExternalTimedTextSources([out, retval] IInspectable **value);
++        HRESULT get_ExternalTimedMetadataTracks([out, retval] IInspectable **value);
++    }
++
++    [uuid(b59f0d9b-4b6e-41ed-bbb4-7c7509a994ad)]
++    interface IMediaSource3 : IInspectable
++    {
++        HRESULT add_StateChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_StateChanged([in] EventRegistrationToken token);
++        HRESULT get_State([out, retval] INT32 *value);
++        HRESULT Reset();
++    }
++
++    [uuid(bdafad57-8eff-4c63-85a6-84de0ae3e4f2)]
++    interface IMediaSource4 : IInspectable
++    {
++        HRESULT get_AdaptiveMediaSource([out, retval] IInspectable **value);
++        HRESULT get_MediaStreamSource([out, retval] IInspectable **value);
++        HRESULT get_MseStreamSource([out, retval] IInspectable **value);
++        HRESULT get_Uri([out, retval] Windows.Foundation.Uri **value);
++        HRESULT OpenAsync([out, retval] Windows.Foundation.IAsyncAction **operation);
++    }
++
++    [uuid(f77d6fa4-4652-410e-b1d8-e9a5e245a45c)]
++    interface IMediaSourceStatics : IInspectable
++    {
++        HRESULT CreateFromAdaptiveMediaSource([in] IInspectable *source, [out, retval] IInspectable **result);
++        HRESULT CreateFromMediaStreamSource([in] IInspectable *source, [out, retval] IInspectable **result);
++        HRESULT CreateFromMseStreamSource([in] IInspectable *source, [out, retval] IInspectable **result);
++        HRESULT CreateFromIMediaSource([in] IInspectable *source, [out, retval] IInspectable **result);
++        HRESULT CreateFromStorageFile([in] IInspectable *file, [out, retval] IInspectable **result);
++        HRESULT CreateFromStream([in] IInspectable *stream, [in] HSTRING type, [out, retval] IInspectable **result);
++        HRESULT CreateFromStreamReference([in] IInspectable *stream, [in] HSTRING type, [out, retval] IInspectable **result);
++        HRESULT CreateFromUri([in] Windows.Foundation.Uri *uri, [out, retval] IInspectable **result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Media.Core.IMediaSourceStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass MediaSource
++    {
++        [default] interface Windows.Media.Core.IMediaSource2;
++    }
++}
++
++namespace Windows.Media.Streaming.Adaptive {
++    runtimeclass AdaptiveMediaSource;
++
++    [uuid(50a6bd5d-66ef-4cd3-9579-9e660507dc3f)]
++    interface IAdaptiveMediaSourceStatics : IInspectable
++    {
++        HRESULT IsContentTypeSupported([in] HSTRING type, [out, retval] boolean *result);
++        HRESULT CreateFromUriAsync([in] Windows.Foundation.Uri *uri, [out, retval] IInspectable **result);
++        HRESULT CreateFromUriWithDownloaderAsync([in] Windows.Foundation.Uri *uri, [in] IInspectable *client, [out, retval] IInspectable **result);
++        HRESULT CreateFromStreamAsync([in] IInspectable *stream, [in] Windows.Foundation.Uri *uri, [in] HSTRING type, [out, retval] IInspectable **result);
++        HRESULT CreateFromStreamWithDownloaderAsync([in] IInspectable *stream, [in] Windows.Foundation.Uri *uri, [in] HSTRING type,
++                [in] IInspectable *client, [out, retval] IInspectable **result);
++    }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        static(Windows.Media.Streaming.Adaptive.IAdaptiveMediaSourceStatics, Windows.Foundation.UniversalApiContract, 1.0),
++        threading(both)
++    ]
++    runtimeclass AdaptiveMediaSource
++    {
++        [default] interface IInspectable;
++    }
++}
++
++namespace Windows.Media.Playback {
++    runtimeclass MediaPlaybackItem;
++
++    [uuid(ef9dc2bc-9317-4696-b051-2bad643177b5)]
++    interface IMediaPlaybackSource : IInspectable
++    {
++    }
++
++    [uuid(047097d2-e4af-48ab-b283-6929e674ece2)]
++    interface IMediaPlaybackItem : IInspectable
++    {
++        HRESULT add_AudioTracksChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_AudioTracksChanged([in] EventRegistrationToken token);
++        HRESULT add_VideoTracksChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_VideoTracksChanged([in] EventRegistrationToken token);
++        HRESULT add_TimedMetadataTracksChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_TimedMetadataTracksChanged([in] EventRegistrationToken token);
++        HRESULT get_Source([out, retval] IInspectable **value);
++        HRESULT get_AudioTracks([out, retval] IInspectable **value);
++        HRESULT get_VideoTracks([out, retval] IInspectable **value);
++        HRESULT get_TimedMetadataTracks([out, retval] IInspectable **value);
++    }
++
++    [uuid(7133fce1-1769-4ff9-a7c1-38d2c4d42360)]
++    interface IMediaPlaybackItemFactory : IInspectable
++    {
++        HRESULT Create([in] IInspectable *source, [out, retval] IInspectable **value);
++    }
++
++    [uuid(82449b9f-7322-4c0b-b03b-3e69a48260c5)]
++    interface IMediaPlayerSource2 : IInspectable
++    {
++        HRESULT get_Source([out, retval] IInspectable **value);
++        HRESULT put_Source([in] IInspectable *value);
++    }
++
++    [uuid(ee0660da-031b-4feb-bd9b-92e0a0a8d299)]
++    interface IMediaPlayer3 : IInspectable
++    {
++        HRESULT add_IsMutedChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_IsMutedChanged([in] EventRegistrationToken token);
++        HRESULT add_SourceChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_SourceChanged([in] EventRegistrationToken token);
++        HRESULT get_AudioBalance([out, retval] DOUBLE *value);
++        HRESULT put_AudioBalance([in] DOUBLE value);
++        HRESULT get_RealTimePlayback([out, retval] boolean *value);
++        HRESULT put_RealTimePlayback([in] boolean value);
++        HRESULT get_StereoscopicVideoRenderMode([out, retval] INT32 *value);
++        HRESULT put_StereoscopicVideoRenderMode([in] INT32 value);
++        HRESULT get_BreakManager([out, retval] IInspectable **value);
++        HRESULT get_CommandManager([out, retval] IInspectable **value);
++        HRESULT get_AudioDevice([out, retval] IInspectable **value);
++        HRESULT put_AudioDevice([in] IInspectable *value);
++        HRESULT get_TimelineController([out, retval] IInspectable **value);
++        HRESULT put_TimelineController([in] IInspectable *value);
++        HRESULT get_TimelineControllerPositionOffset([out, retval] Windows.Foundation.TimeSpan *value);
++        HRESULT put_TimelineControllerPositionOffset([in] Windows.Foundation.TimeSpan value);
++        HRESULT get_PlaybackSession([out, retval] IInspectable **value);
++        HRESULT StepForwardOneFrame();
++        HRESULT StepBackwardOneFrame();
++        HRESULT GetAsCastingSource([out, retval] IInspectable **value);
++    }
++
++    [uuid(cfe537fd-f86a-4446-bf4d-c8e792b7b4b3)]
++    interface IMediaPlayer5 : IInspectable
++    {
++        HRESULT add_VideoFrameAvailable([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_VideoFrameAvailable([in] EventRegistrationToken token);
++        HRESULT get_IsVideoFrameServerEnabled([out, retval] boolean *value);
++        HRESULT put_IsVideoFrameServerEnabled([in] boolean value);
++        HRESULT CopyFrameToVideoSurface([in] Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface *destination);
++        HRESULT CopyFrameToVideoSurfaceWithTargetRectangle([in] Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface *destination,
++                [in] Windows.Foundation.Rect rect);
++        HRESULT CopyFrameToStereoscopicVideoSurfaces([in] Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface *left,
++                [in] Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface *right);
++    }
++
++    [uuid(c32b683d-0407-41ba-8946-8b345a5a5435)]
++    interface IMediaPlaybackSession : IInspectable
++    {
++        HRESULT add_PlaybackStateChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_PlaybackStateChanged([in] EventRegistrationToken token);
++        HRESULT add_PlaybackRateChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_PlaybackRateChanged([in] EventRegistrationToken token);
++        HRESULT add_SeekCompleted([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_SeekCompleted([in] EventRegistrationToken token);
++        HRESULT add_BufferingStarted([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_BufferingStarted([in] EventRegistrationToken token);
++        HRESULT add_BufferingEnded([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_BufferingEnded([in] EventRegistrationToken token);
++        HRESULT add_BufferingProgressChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_BufferingProgressChanged([in] EventRegistrationToken token);
++        HRESULT add_DownloadProgressChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_DownloadProgressChanged([in] EventRegistrationToken token);
++        HRESULT add_NaturalDurationChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_NaturalDurationChanged([in] EventRegistrationToken token);
++        HRESULT add_PositionChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_PositionChanged([in] EventRegistrationToken token);
++        HRESULT add_NaturalVideoSizeChanged([in] IUnknown *handler, [out, retval] EventRegistrationToken *token);
++        HRESULT remove_NaturalVideoSizeChanged([in] EventRegistrationToken token);
++        HRESULT get_MediaPlayer([out, retval] Windows.Media.Playback.MediaPlayer **value);
++        HRESULT get_NaturalDuration([out, retval] Windows.Foundation.TimeSpan *value);
++        HRESULT get_Position([out, retval] Windows.Foundation.TimeSpan *value);
++        HRESULT put_Position([in] Windows.Foundation.TimeSpan value);
++        HRESULT get_PlaybackState([out, retval] INT32 *value);
++        HRESULT get_CanSeek([out, retval] boolean *value);
++        HRESULT get_CanPause([out, retval] boolean *value);
++        HRESULT get_IsProtected([out, retval] boolean *value);
++        HRESULT get_PlaybackRate([out, retval] DOUBLE *value);
++        HRESULT put_PlaybackRate([in] DOUBLE value);
++        HRESULT get_BufferingProgress([out, retval] DOUBLE *value);
++        HRESULT get_DownloadProgress([out, retval] DOUBLE *value);
++        HRESULT get_NaturalVideoHeight([out, retval] UINT32 *value);
++        HRESULT get_NaturalVideoWidth([out, retval] UINT32 *value);
++        HRESULT get_NormalizedSourceRect([out, retval] Windows.Foundation.Rect *value);
++        HRESULT put_NormalizedSourceRect([in] Windows.Foundation.Rect value);
++        HRESULT get_StereoscopicVideoPackingMode([out, retval] INT32 *value);
++        HRESULT put_StereoscopicVideoPackingMode([in] INT32 value);
++    }
++
++    [
++        activatable(Windows.Media.Playback.IMediaPlaybackItemFactory, Windows.Foundation.UniversalApiContract, 1.0),
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        marshaling_behavior(agile),
++        threading(both)
++    ]
++    runtimeclass MediaPlaybackItem
++    {
++        [default] interface Windows.Media.Playback.IMediaPlaybackItem;
++    }
++}
+diff --git a/dlls/windows.media.playback.mediaplayer/private.h b/dlls/windows.media.playback.mediaplayer/private.h
+index f1bc402..4bafe33 100644
+--- a/dlls/windows.media.playback.mediaplayer/private.h
++++ b/dlls/windows.media.playback.mediaplayer/private.h
+@@ -34,9 +34,42 @@
+ #define WIDL_using_Windows_Foundation_Collections
+ #include "windows.foundation.h"
+ #define WIDL_using_Windows_Media
++#define WIDL_using_Windows_Media_Core
++#define WIDL_using_Windows_Graphics_DirectX_Direct3D11
+ #define WIDL_using_Windows_Media_Playback
++#define WIDL_using_Windows_Media_Streaming_Adaptive
+ #include "windows.media.playback.h"
+ #include "systemmediatransportcontrolsinterop.h"
++#include "mfapi.h"
++#include "mferror.h"
++#include "mfmediaengine.h"
++#include "d3d11_4.h"
++#include "wincodec.h"
++#include "windows.media.core.h"
++#include "windows.graphics.directx.direct3d11.interop.h"
++#include "media_private.h"
++
++/* LinDobe: MediaSource, MediaPlaybackItem and the frame-server MediaPlayer (Lightroom Classic's What's New). */
++DEFINE_GUID( IID_media_source_private, 0x6b3c7c64, 0x2f0e, 0x4d8b, 0x9a, 0x51, 0x3e, 0x47, 0x0c, 0x2d, 0x81, 0x5f );
++
++extern IActivationFactory *media_source_factory;
++extern IActivationFactory *playback_item_factory;
++extern IActivationFactory *adaptive_source_factory;
++/* the URL a MediaSource or MediaPlaybackItem plays (a new HSTRING) */
++HRESULT media_source_get_url( IInspectable *source, HSTRING *url );
++HRESULT media_source_create_from_url( HSTRING url, IInspectable **out );
++
++/* event handlers: delegates are IUnknown with Invoke( sender, args ) */
++#define MAX_EVENT_HANDLERS 8
++struct event_handlers
++{
++    IUnknown *handler[MAX_EVENT_HANDLERS];
++    INT64 token[MAX_EVENT_HANDLERS];
++};
++HRESULT event_handlers_add( struct event_handlers *list, CRITICAL_SECTION *cs, IUnknown *handler, EventRegistrationToken *token );
++HRESULT event_handlers_remove( struct event_handlers *list, CRITICAL_SECTION *cs, EventRegistrationToken token );
++void event_handlers_invoke( struct event_handlers *list, CRITICAL_SECTION *cs, IInspectable *sender, IInspectable *args );
++void event_handlers_clear( struct event_handlers *list );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/dlls/windows.media.playback.mediaplayer/source.c b/dlls/windows.media.playback.mediaplayer/source.c
+new file mode 100644
+index 0000000..17ba08d
+--- /dev/null
++++ b/dlls/windows.media.playback.mediaplayer/source.c
+@@ -0,0 +1,1168 @@
++/* WinRT Windows.Media.Core.MediaSource and Windows.Media.Playback.MediaPlaybackItem (URI sources)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(mediaplayer);
++
++static LONG64 next_token;
++
++HRESULT event_handlers_add( struct event_handlers *list, CRITICAL_SECTION *cs, IUnknown *handler, EventRegistrationToken *token )
++{
++    HRESULT hr = E_OUTOFMEMORY;
++    UINT i;
++
++    if (!handler || !token) return E_INVALIDARG;
++    EnterCriticalSection( cs );
++    for (i = 0; i < MAX_EVENT_HANDLERS; i++)
++    {
++        if (list->handler[i]) continue;
++        list->handler[i] = handler;
++        IUnknown_AddRef( handler );
++        token->value = list->token[i] = InterlockedIncrement64( &next_token );
++        hr = S_OK;
++        break;
++    }
++    LeaveCriticalSection( cs );
++    return hr;
++}
++
++HRESULT event_handlers_remove( struct event_handlers *list, CRITICAL_SECTION *cs, EventRegistrationToken token )
++{
++    IUnknown *handler = NULL;
++    UINT i;
++
++    EnterCriticalSection( cs );
++    for (i = 0; i < MAX_EVENT_HANDLERS; i++)
++    {
++        if (!list->handler[i] || list->token[i] != token.value) continue;
++        handler = list->handler[i];
++        list->handler[i] = NULL;
++        break;
++    }
++    LeaveCriticalSection( cs );
++    if (handler) IUnknown_Release( handler );
++    return S_OK;
++}
++
++typedef HRESULT (WINAPI *delegate_invoke)( IUnknown *iface, IInspectable *sender, IInspectable *args );
++
++void event_handlers_invoke( struct event_handlers *list, CRITICAL_SECTION *cs, IInspectable *sender, IInspectable *args )
++{
++    IUnknown *handlers[MAX_EVENT_HANDLERS];
++    UINT i, count = 0;
++
++    EnterCriticalSection( cs );
++    for (i = 0; i < MAX_EVENT_HANDLERS; i++)
++        if (list->handler[i])
++        {
++            handlers[count] = list->handler[i];
++            IUnknown_AddRef( handlers[count] );
++            count++;
++        }
++    LeaveCriticalSection( cs );
++
++    for (i = 0; i < count; i++)
++    {
++        delegate_invoke invoke = ((delegate_invoke *)handlers[i]->lpVtbl)[3];
++        HRESULT hr = invoke( handlers[i], sender, args );
++        if (FAILED(hr)) WARN( "handler %p returned %#lx.\n", handlers[i], hr );
++        IUnknown_Release( handlers[i] );
++    }
++}
++
++void event_handlers_clear( struct event_handlers *list )
++{
++    UINT i;
++
++    for (i = 0; i < MAX_EVENT_HANDLERS; i++)
++    {
++        if (list->handler[i]) IUnknown_Release( list->handler[i] );
++        list->handler[i] = NULL;
++    }
++}
++
++/* MediaSource */
++
++struct media_source
++{
++    IMediaSource2 IMediaSource2_iface;
++    IMediaSource IMediaSource_iface;
++    IMediaPlaybackSource IMediaPlaybackSource_iface;
++    IClosable IClosable_iface;
++    IMediaSource3 IMediaSource3_iface;
++    IMediaSource4 IMediaSource4_iface;
++    LONG ref;
++
++    CRITICAL_SECTION cs;
++    struct event_handlers opened;
++    struct event_handlers state_changed;
++    HSTRING url;
++    IUriRuntimeClass *uri;
++    INT32 state;    /* MediaSourceState: Initial, Opening, Opened, Failed, Closed */
++};
++
++static inline struct media_source *impl_from_IMediaSource2( IMediaSource2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct media_source, IMediaSource2_iface );
++}
++
++static HRESULT WINAPI media_source_QueryInterface( IMediaSource2 *iface, REFIID iid, void **out )
++{
++    struct media_source *impl = impl_from_IMediaSource2( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMediaSource2 ) ||
++        IsEqualGUID( iid, &IID_media_source_private ))
++        *out = &impl->IMediaSource2_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaSource ))
++        *out = &impl->IMediaSource_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlaybackSource ))
++        *out = &impl->IMediaPlaybackSource_iface;
++    else if (IsEqualGUID( iid, &IID_IClosable ))
++        *out = &impl->IClosable_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaSource3 ))
++        *out = &impl->IMediaSource3_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaSource4 ))
++        *out = &impl->IMediaSource4_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI media_source_AddRef( IMediaSource2 *iface )
++{
++    struct media_source *impl = impl_from_IMediaSource2( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI media_source_Release( IMediaSource2 *iface )
++{
++    struct media_source *impl = impl_from_IMediaSource2( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        event_handlers_clear( &impl->opened );
++        event_handlers_clear( &impl->state_changed );
++        if (impl->uri) IUriRuntimeClass_Release( impl->uri );
++        WindowsDeleteString( impl->url );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI media_source_GetIids( IMediaSource2 *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI media_source_GetRuntimeClassName( IMediaSource2 *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Media_Core_MediaSource,
++                                wcslen( RuntimeClass_Windows_Media_Core_MediaSource ), class_name );
++}
++
++static HRESULT WINAPI media_source_GetTrustLevel( IMediaSource2 *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_source_add_OpenOperationCompleted( IMediaSource2 *iface, IUnknown *handler, EventRegistrationToken *token )
++{
++    struct media_source *impl = impl_from_IMediaSource2( iface );
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    return event_handlers_add( &impl->opened, &impl->cs, handler, token );
++}
++
++static HRESULT WINAPI media_source_remove_OpenOperationCompleted( IMediaSource2 *iface, EventRegistrationToken token )
++{
++    struct media_source *impl = impl_from_IMediaSource2( iface );
++    TRACE( "iface %p, token %#I64x.\n", iface, token.value );
++    return event_handlers_remove( &impl->opened, &impl->cs, token );
++}
++
++static HRESULT WINAPI media_source_get_CustomProperties( IMediaSource2 *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI media_source_get_Duration( IMediaSource2 *iface, IInspectable **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = NULL; /* IReference<TimeSpan>: unknown until opened */
++    return S_OK;
++}
++
++static HRESULT WINAPI media_source_get_IsOpen( IMediaSource2 *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = impl_from_IMediaSource2( iface )->state == 2;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_source_get_ExternalTimedTextSources( IMediaSource2 *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI media_source_get_ExternalTimedMetadataTracks( IMediaSource2 *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IMediaSource2Vtbl media_source_vtbl =
++{
++    media_source_QueryInterface,
++    media_source_AddRef,
++    media_source_Release,
++    media_source_GetIids,
++    media_source_GetRuntimeClassName,
++    media_source_GetTrustLevel,
++    media_source_add_OpenOperationCompleted,
++    media_source_remove_OpenOperationCompleted,
++    media_source_get_CustomProperties,
++    media_source_get_Duration,
++    media_source_get_IsOpen,
++    media_source_get_ExternalTimedTextSources,
++    media_source_get_ExternalTimedMetadataTracks,
++};
++
++DEFINE_IINSPECTABLE( media_source_base, IMediaSource, struct media_source, IMediaSource2_iface )
++
++static const struct IMediaSourceVtbl media_source_base_vtbl =
++{
++    media_source_base_QueryInterface,
++    media_source_base_AddRef,
++    media_source_base_Release,
++    media_source_base_GetIids,
++    media_source_base_GetRuntimeClassName,
++    media_source_base_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE_( media_source_playback, IMediaPlaybackSource, struct media_source, source_from_IMediaPlaybackSource,
++                      IMediaPlaybackSource_iface, &impl->IMediaSource2_iface )
++
++static const struct IMediaPlaybackSourceVtbl media_source_playback_vtbl =
++{
++    media_source_playback_QueryInterface,
++    media_source_playback_AddRef,
++    media_source_playback_Release,
++    media_source_playback_GetIids,
++    media_source_playback_GetRuntimeClassName,
++    media_source_playback_GetTrustLevel,
++};
++
++DEFINE_IINSPECTABLE( media_source_closable, IClosable, struct media_source, IMediaSource2_iface )
++
++static HRESULT WINAPI media_source_closable_Close( IClosable *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++
++static const struct IClosableVtbl media_source_closable_vtbl =
++{
++    media_source_closable_QueryInterface,
++    media_source_closable_AddRef,
++    media_source_closable_Release,
++    media_source_closable_GetIids,
++    media_source_closable_GetRuntimeClassName,
++    media_source_closable_GetTrustLevel,
++    media_source_closable_Close,
++};
++
++DEFINE_IINSPECTABLE( media_source3, IMediaSource3, struct media_source, IMediaSource2_iface )
++
++static HRESULT WINAPI media_source3_add_StateChanged( IMediaSource3 *iface, IUnknown *handler, EventRegistrationToken *token )
++{
++    struct media_source *impl = impl_from_IMediaSource3( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return event_handlers_add( &impl->state_changed, &impl->cs, handler, token );
++}
++
++static HRESULT WINAPI media_source3_remove_StateChanged( IMediaSource3 *iface, EventRegistrationToken token )
++{
++    struct media_source *impl = impl_from_IMediaSource3( iface );
++    return event_handlers_remove( &impl->state_changed, &impl->cs, token );
++}
++
++static HRESULT WINAPI media_source3_get_State( IMediaSource3 *iface, INT32 *value )
++{
++    *value = impl_from_IMediaSource3( iface )->state;
++    TRACE( "iface %p, state %d.\n", iface, *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI media_source3_Reset( IMediaSource3 *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    impl_from_IMediaSource3( iface )->state = 0;
++    return S_OK;
++}
++
++static const struct IMediaSource3Vtbl media_source3_vtbl =
++{
++    media_source3_QueryInterface,
++    media_source3_AddRef,
++    media_source3_Release,
++    media_source3_GetIids,
++    media_source3_GetRuntimeClassName,
++    media_source3_GetTrustLevel,
++    media_source3_add_StateChanged,
++    media_source3_remove_StateChanged,
++    media_source3_get_State,
++    media_source3_Reset,
++};
++
++/* an IAsyncAction that has already completed */
++
++struct async_action
++{
++    IAsyncAction IAsyncAction_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    HRESULT result;
++    IAsyncActionCompletedHandler *handler;
++};
++
++static inline struct async_action *impl_from_IAsyncAction( IAsyncAction *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_action, IAsyncAction_iface );
++}
++
++static HRESULT WINAPI async_action_QueryInterface( IAsyncAction *iface, REFIID iid, void **out )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IAsyncAction ))
++        *out = &impl->IAsyncAction_iface;
++    else if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++        *out = &impl->IAsyncInfo_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI async_action_AddRef( IAsyncAction *iface )
++{
++    return InterlockedIncrement( &impl_from_IAsyncAction( iface )->ref );
++}
++
++static ULONG WINAPI async_action_Release( IAsyncAction *iface )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncActionCompletedHandler_Release( impl->handler );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI async_action_GetIids( IAsyncAction *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_action_GetRuntimeClassName( IAsyncAction *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_action_GetTrustLevel( IAsyncAction *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_action_put_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler *handler )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (!handler) return E_POINTER;
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    IAsyncActionCompletedHandler_AddRef( (impl->handler = handler) );
++    IAsyncActionCompletedHandler_Invoke( handler, iface, SUCCEEDED(impl->result) ? Completed : Error );
++    return S_OK;
++}
++
++static HRESULT WINAPI async_action_get_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler **handler )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++    if ((*handler = impl->handler)) IAsyncActionCompletedHandler_AddRef( *handler );
++    return S_OK;
++}
++
++static HRESULT WINAPI async_action_GetResults( IAsyncAction *iface )
++{
++    return impl_from_IAsyncAction( iface )->result;
++}
++
++static const struct IAsyncActionVtbl async_action_vtbl =
++{
++    async_action_QueryInterface,
++    async_action_AddRef,
++    async_action_Release,
++    async_action_GetIids,
++    async_action_GetRuntimeClassName,
++    async_action_GetTrustLevel,
++    async_action_put_Completed,
++    async_action_get_Completed,
++    async_action_GetResults,
++};
++
++DEFINE_IINSPECTABLE( async_info, IAsyncInfo, struct async_action, IAsyncAction_iface )
++
++static HRESULT WINAPI async_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    *id = 1;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    *status = SUCCEEDED(impl_from_IAsyncInfo( iface )->result) ? Completed : Error;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
++{
++    *error_code = impl_from_IAsyncInfo( iface )->result;
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_Cancel( IAsyncInfo *iface )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI async_info_Close( IAsyncInfo *iface )
++{
++    return S_OK;
++}
++
++static const struct IAsyncInfoVtbl async_info_vtbl =
++{
++    async_info_QueryInterface,
++    async_info_AddRef,
++    async_info_Release,
++    async_info_GetIids,
++    async_info_GetRuntimeClassName,
++    async_info_GetTrustLevel,
++    async_info_get_Id,
++    async_info_get_Status,
++    async_info_get_ErrorCode,
++    async_info_Cancel,
++    async_info_Close,
++};
++
++static HRESULT async_action_create_completed( HRESULT result, IAsyncAction **out )
++{
++    struct async_action *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncAction_iface.lpVtbl = &async_action_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_info_vtbl;
++    impl->ref = 1;
++    impl->result = result;
++    *out = &impl->IAsyncAction_iface;
++    return S_OK;
++}
++
++DEFINE_IINSPECTABLE( media_source4, IMediaSource4, struct media_source, IMediaSource2_iface )
++
++static HRESULT WINAPI media_source4_get_none( IMediaSource4 *iface, IInspectable **value )
++{
++    *value = NULL;
++    return S_OK;
++}
++
++static HRESULT WINAPI media_source4_get_Uri( IMediaSource4 *iface, IUriRuntimeClass **value )
++{
++    struct media_source *impl = impl_from_IMediaSource4( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if ((*value = impl->uri)) IUriRuntimeClass_AddRef( *value );
++    return S_OK;
++}
++
++/* the media engine opens the file when the player plays it; a local file is ready now */
++static HRESULT WINAPI media_source4_OpenAsync( IMediaSource4 *iface, IAsyncAction **operation )
++{
++    struct media_source *impl = impl_from_IMediaSource4( iface );
++
++    TRACE( "iface %p, operation %p.\n", iface, operation );
++
++    if (impl->state != 2)
++    {
++        impl->state = 2;
++        event_handlers_invoke( &impl->state_changed, &impl->cs, (IInspectable *)&impl->IMediaSource2_iface, NULL );
++    }
++    return async_action_create_completed( S_OK, operation );
++}
++
++static const struct IMediaSource4Vtbl media_source4_vtbl =
++{
++    media_source4_QueryInterface,
++    media_source4_AddRef,
++    media_source4_Release,
++    media_source4_GetIids,
++    media_source4_GetRuntimeClassName,
++    media_source4_GetTrustLevel,
++    media_source4_get_none,                 /* AdaptiveMediaSource */
++    media_source4_get_none,                 /* MediaStreamSource */
++    media_source4_get_none,                 /* MseStreamSource */
++    media_source4_get_Uri,
++    media_source4_OpenAsync,
++};
++
++HRESULT media_source_create_from_url( HSTRING url, IInspectable **out )
++{
++    struct media_source *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IMediaSource2_iface.lpVtbl = &media_source_vtbl;
++    impl->IMediaSource_iface.lpVtbl = &media_source_base_vtbl;
++    impl->IMediaPlaybackSource_iface.lpVtbl = &media_source_playback_vtbl;
++    impl->IClosable_iface.lpVtbl = &media_source_closable_vtbl;
++    impl->IMediaSource3_iface.lpVtbl = &media_source3_vtbl;
++    impl->IMediaSource4_iface.lpVtbl = &media_source4_vtbl;
++    impl->ref = 1;
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": media_source.cs");
++    if (FAILED(hr = WindowsDuplicateString( url, &impl->url )))
++    {
++        IMediaSource2_Release( &impl->IMediaSource2_iface );
++        return hr;
++    }
++
++    TRACE( "created %p for %s.\n", impl, debugstr_hstring( url ) );
++    *out = (IInspectable *)&impl->IMediaSource2_iface;
++    return S_OK;
++}
++
++/* MediaSource statics */
++
++struct media_source_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IMediaSourceStatics IMediaSourceStatics_iface;
++    LONG ref;
++};
++
++static inline struct media_source_statics *impl_from_source_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct media_source_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI source_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct media_source_statics *impl = impl_from_source_factory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaSourceStatics ))
++        *out = &impl->IMediaSourceStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI source_factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_source_factory( iface )->ref );
++}
++
++static ULONG WINAPI source_factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_source_factory( iface )->ref );
++}
++
++static HRESULT WINAPI source_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI source_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI source_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI source_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl source_factory_vtbl =
++{
++    source_factory_QueryInterface,
++    source_factory_AddRef,
++    source_factory_Release,
++    source_factory_GetIids,
++    source_factory_GetRuntimeClassName,
++    source_factory_GetTrustLevel,
++    source_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( source_statics, IMediaSourceStatics, struct media_source_statics, IActivationFactory_iface )
++
++#define SOURCE_STATICS_STUB( name, ... )                                                            \
++    static HRESULT WINAPI source_statics_##name( IMediaSourceStatics *iface, __VA_ARGS__, IInspectable **result ) \
++    {                                                                                               \
++        FIXME( "iface %p stub!\n", iface );                                                         \
++        *result = NULL;                                                                             \
++        return E_NOTIMPL;                                                                           \
++    }
++
++SOURCE_STATICS_STUB( CreateFromAdaptiveMediaSource, IInspectable *source )
++SOURCE_STATICS_STUB( CreateFromMediaStreamSource, IInspectable *source )
++SOURCE_STATICS_STUB( CreateFromMseStreamSource, IInspectable *source )
++SOURCE_STATICS_STUB( CreateFromIMediaSource, IInspectable *source )
++SOURCE_STATICS_STUB( CreateFromStorageFile, IInspectable *file )
++SOURCE_STATICS_STUB( CreateFromStream, IInspectable *stream, HSTRING type )
++SOURCE_STATICS_STUB( CreateFromStreamReference, IInspectable *stream, HSTRING type )
++
++static HRESULT WINAPI source_statics_CreateFromUri( IMediaSourceStatics *iface, IUriRuntimeClass *uri, IInspectable **result )
++{
++    HSTRING url;
++    HRESULT hr;
++
++    TRACE( "iface %p, uri %p, result %p.\n", iface, uri, result );
++
++    *result = NULL;
++    if (!uri) return E_POINTER;
++    if (FAILED(hr = IUriRuntimeClass_get_AbsoluteUri( uri, &url ))) return hr;
++    hr = media_source_create_from_url( url, result );
++    WindowsDeleteString( url );
++    if (SUCCEEDED(hr))
++    {
++        struct media_source *impl = impl_from_IMediaSource2( (IMediaSource2 *)*result );
++        IUriRuntimeClass_AddRef( (impl->uri = uri) );
++    }
++    return hr;
++}
++
++static const struct IMediaSourceStaticsVtbl source_statics_vtbl =
++{
++    source_statics_QueryInterface,
++    source_statics_AddRef,
++    source_statics_Release,
++    source_statics_GetIids,
++    source_statics_GetRuntimeClassName,
++    source_statics_GetTrustLevel,
++    source_statics_CreateFromAdaptiveMediaSource,
++    source_statics_CreateFromMediaStreamSource,
++    source_statics_CreateFromMseStreamSource,
++    source_statics_CreateFromIMediaSource,
++    source_statics_CreateFromStorageFile,
++    source_statics_CreateFromStream,
++    source_statics_CreateFromStreamReference,
++    source_statics_CreateFromUri,
++};
++
++static struct media_source_statics media_source_statics =
++{
++    {&source_factory_vtbl},
++    {&source_statics_vtbl},
++    1,
++};
++
++IActivationFactory *media_source_factory = &media_source_statics.IActivationFactory_iface;
++
++/* MediaPlaybackItem */
++
++struct playback_item
++{
++    IMediaPlaybackItem IMediaPlaybackItem_iface;
++    IMediaPlaybackSource IMediaPlaybackSource_iface;
++    LONG ref;
++
++    IInspectable *source;
++};
++
++static inline struct playback_item *impl_from_IMediaPlaybackItem( IMediaPlaybackItem *iface )
++{
++    return CONTAINING_RECORD( iface, struct playback_item, IMediaPlaybackItem_iface );
++}
++
++static HRESULT WINAPI playback_item_QueryInterface( IMediaPlaybackItem *iface, REFIID iid, void **out )
++{
++    struct playback_item *impl = impl_from_IMediaPlaybackItem( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IMediaPlaybackItem ))
++        *out = &impl->IMediaPlaybackItem_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlaybackSource ))
++        *out = &impl->IMediaPlaybackSource_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI playback_item_AddRef( IMediaPlaybackItem *iface )
++{
++    struct playback_item *impl = impl_from_IMediaPlaybackItem( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI playback_item_Release( IMediaPlaybackItem *iface )
++{
++    struct playback_item *impl = impl_from_IMediaPlaybackItem( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        if (impl->source) IInspectable_Release( impl->source );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI playback_item_GetIids( IMediaPlaybackItem *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI playback_item_GetRuntimeClassName( IMediaPlaybackItem *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Media_Playback_MediaPlaybackItem,
++                                wcslen( RuntimeClass_Windows_Media_Playback_MediaPlaybackItem ), class_name );
++}
++
++static HRESULT WINAPI playback_item_GetTrustLevel( IMediaPlaybackItem *iface, TrustLevel *trust_level )
++{
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++#define ITEM_EVENT_STUBS( name )                                                                     \
++    static HRESULT WINAPI playback_item_add_##name( IMediaPlaybackItem *iface, IUnknown *handler, EventRegistrationToken *token ) \
++    {                                                                                                \
++        TRACE( "iface %p, handler %p.\n", iface, handler );                                          \
++        token->value = InterlockedIncrement64( &next_token );                                        \
++        return S_OK;                                                                                 \
++    }                                                                                                \
++    static HRESULT WINAPI playback_item_remove_##name( IMediaPlaybackItem *iface, EventRegistrationToken token ) \
++    {                                                                                                \
++        return S_OK;                                                                                 \
++    }
++
++ITEM_EVENT_STUBS( AudioTracksChanged )
++ITEM_EVENT_STUBS( VideoTracksChanged )
++ITEM_EVENT_STUBS( TimedMetadataTracksChanged )
++
++static HRESULT WINAPI playback_item_get_Source( IMediaPlaybackItem *iface, IInspectable **value )
++{
++    struct playback_item *impl = impl_from_IMediaPlaybackItem( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    if ((*value = impl->source)) IInspectable_AddRef( *value );
++    return S_OK;
++}
++
++static HRESULT WINAPI playback_item_get_tracks( IMediaPlaybackItem *iface, IInspectable **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    *value = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IMediaPlaybackItemVtbl playback_item_vtbl =
++{
++    playback_item_QueryInterface,
++    playback_item_AddRef,
++    playback_item_Release,
++    playback_item_GetIids,
++    playback_item_GetRuntimeClassName,
++    playback_item_GetTrustLevel,
++    playback_item_add_AudioTracksChanged,
++    playback_item_remove_AudioTracksChanged,
++    playback_item_add_VideoTracksChanged,
++    playback_item_remove_VideoTracksChanged,
++    playback_item_add_TimedMetadataTracksChanged,
++    playback_item_remove_TimedMetadataTracksChanged,
++    playback_item_get_Source,
++    playback_item_get_tracks,
++    playback_item_get_tracks,
++    playback_item_get_tracks,
++};
++
++DEFINE_IINSPECTABLE_( playback_item_source, IMediaPlaybackSource, struct playback_item, item_from_IMediaPlaybackSource,
++                      IMediaPlaybackSource_iface, &impl->IMediaPlaybackItem_iface )
++
++static const struct IMediaPlaybackSourceVtbl playback_item_source_vtbl =
++{
++    playback_item_source_QueryInterface,
++    playback_item_source_AddRef,
++    playback_item_source_Release,
++    playback_item_source_GetIids,
++    playback_item_source_GetRuntimeClassName,
++    playback_item_source_GetTrustLevel,
++};
++
++HRESULT media_source_get_url( IInspectable *source, HSTRING *url )
++{
++    IMediaPlaybackItem *item_iface;
++    IMediaSource2 *source_iface;
++    HRESULT hr;
++
++    *url = NULL;
++    if (!source) return E_POINTER;
++    if (SUCCEEDED(IInspectable_QueryInterface( source, &IID_media_source_private, (void **)&source_iface )))
++    {
++        hr = WindowsDuplicateString( impl_from_IMediaSource2( source_iface )->url, url );
++        IMediaSource2_Release( source_iface );
++        return hr;
++    }
++    if (SUCCEEDED(IInspectable_QueryInterface( source, &IID_IMediaPlaybackItem, (void **)&item_iface )))
++    {
++        if (item_iface->lpVtbl == &playback_item_vtbl)
++            hr = media_source_get_url( impl_from_IMediaPlaybackItem( item_iface )->source, url );
++        else
++            hr = E_NOTIMPL;
++        IMediaPlaybackItem_Release( item_iface );
++        return hr;
++    }
++    FIXME( "unsupported source %p.\n", source );
++    return E_NOTIMPL;
++}
++
++/* MediaPlaybackItem factory */
++
++struct playback_item_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IMediaPlaybackItemFactory IMediaPlaybackItemFactory_iface;
++    LONG ref;
++};
++
++static inline struct playback_item_statics *impl_from_item_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct playback_item_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI item_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct playback_item_statics *impl = impl_from_item_factory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IMediaPlaybackItemFactory ))
++        *out = &impl->IMediaPlaybackItemFactory_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI item_factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_item_factory( iface )->ref );
++}
++
++static ULONG WINAPI item_factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_item_factory( iface )->ref );
++}
++
++static HRESULT WINAPI item_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI item_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI item_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI item_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl item_factory_vtbl =
++{
++    item_factory_QueryInterface,
++    item_factory_AddRef,
++    item_factory_Release,
++    item_factory_GetIids,
++    item_factory_GetRuntimeClassName,
++    item_factory_GetTrustLevel,
++    item_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( item_statics, IMediaPlaybackItemFactory, struct playback_item_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI item_statics_Create( IMediaPlaybackItemFactory *iface, IInspectable *source, IInspectable **value )
++{
++    struct playback_item *impl;
++
++    TRACE( "iface %p, source %p, value %p.\n", iface, source, value );
++
++    *value = NULL;
++    if (!source) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IMediaPlaybackItem_iface.lpVtbl = &playback_item_vtbl;
++    impl->IMediaPlaybackSource_iface.lpVtbl = &playback_item_source_vtbl;
++    impl->ref = 1;
++    IInspectable_AddRef( (impl->source = source) );
++    *value = (IInspectable *)&impl->IMediaPlaybackItem_iface;
++    return S_OK;
++}
++
++static const struct IMediaPlaybackItemFactoryVtbl item_statics_vtbl =
++{
++    item_statics_QueryInterface,
++    item_statics_AddRef,
++    item_statics_Release,
++    item_statics_GetIids,
++    item_statics_GetRuntimeClassName,
++    item_statics_GetTrustLevel,
++    item_statics_Create,
++};
++
++static struct playback_item_statics playback_item_statics =
++{
++    {&item_factory_vtbl},
++    {&item_statics_vtbl},
++    1,
++};
++
++IActivationFactory *playback_item_factory = &playback_item_statics.IActivationFactory_iface;
++
++/* AdaptiveMediaSource statics: HLS and DASH manifests are not supported; callers fall back to MediaSource */
++
++struct adaptive_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    IAdaptiveMediaSourceStatics IAdaptiveMediaSourceStatics_iface;
++    LONG ref;
++};
++
++static inline struct adaptive_statics *impl_from_adaptive_factory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct adaptive_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI adaptive_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct adaptive_statics *impl = impl_from_adaptive_factory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &IID_IActivationFactory ))
++        *out = &impl->IActivationFactory_iface;
++    else if (IsEqualGUID( iid, &IID_IAdaptiveMediaSourceStatics ))
++        *out = &impl->IAdaptiveMediaSourceStatics_iface;
++    else
++    {
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++        *out = NULL;
++        return E_NOINTERFACE;
++    }
++    IInspectable_AddRef( (IInspectable *)*out );
++    return S_OK;
++}
++
++static ULONG WINAPI adaptive_factory_AddRef( IActivationFactory *iface )
++{
++    return InterlockedIncrement( &impl_from_adaptive_factory( iface )->ref );
++}
++
++static ULONG WINAPI adaptive_factory_Release( IActivationFactory *iface )
++{
++    return InterlockedDecrement( &impl_from_adaptive_factory( iface )->ref );
++}
++
++static HRESULT WINAPI adaptive_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI adaptive_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI adaptive_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI adaptive_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl adaptive_factory_vtbl =
++{
++    adaptive_factory_QueryInterface,
++    adaptive_factory_AddRef,
++    adaptive_factory_Release,
++    adaptive_factory_GetIids,
++    adaptive_factory_GetRuntimeClassName,
++    adaptive_factory_GetTrustLevel,
++    adaptive_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( adaptive_statics, IAdaptiveMediaSourceStatics, struct adaptive_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI adaptive_statics_IsContentTypeSupported( IAdaptiveMediaSourceStatics *iface, HSTRING type, boolean *result )
++{
++    TRACE( "iface %p, type %s.\n", iface, debugstr_hstring( type ) );
++    *result = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI adaptive_statics_CreateFromUriAsync( IAdaptiveMediaSourceStatics *iface, IUriRuntimeClass *uri, IInspectable **result )
++{
++    FIXME( "iface %p, uri %p stub!\n", iface, uri );
++    *result = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI adaptive_statics_CreateFromUriWithDownloaderAsync( IAdaptiveMediaSourceStatics *iface, IUriRuntimeClass *uri,
++                                                                          IInspectable *client, IInspectable **result )
++{
++    FIXME( "iface %p, uri %p stub!\n", iface, uri );
++    *result = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI adaptive_statics_CreateFromStreamAsync( IAdaptiveMediaSourceStatics *iface, IInspectable *stream,
++                                                              IUriRuntimeClass *uri, HSTRING type, IInspectable **result )
++{
++    FIXME( "iface %p, stream %p stub!\n", iface, stream );
++    *result = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI adaptive_statics_CreateFromStreamWithDownloaderAsync( IAdaptiveMediaSourceStatics *iface, IInspectable *stream,
++                                                                            IUriRuntimeClass *uri, HSTRING type, IInspectable *client,
++                                                                            IInspectable **result )
++{
++    FIXME( "iface %p, stream %p stub!\n", iface, stream );
++    *result = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct IAdaptiveMediaSourceStaticsVtbl adaptive_statics_vtbl =
++{
++    adaptive_statics_QueryInterface,
++    adaptive_statics_AddRef,
++    adaptive_statics_Release,
++    adaptive_statics_GetIids,
++    adaptive_statics_GetRuntimeClassName,
++    adaptive_statics_GetTrustLevel,
++    adaptive_statics_IsContentTypeSupported,
++    adaptive_statics_CreateFromUriAsync,
++    adaptive_statics_CreateFromUriWithDownloaderAsync,
++    adaptive_statics_CreateFromStreamAsync,
++    adaptive_statics_CreateFromStreamWithDownloaderAsync,
++};
++
++static struct adaptive_statics adaptive_statics =
++{
++    {&adaptive_factory_vtbl},
++    {&adaptive_statics_vtbl},
++    1,
++};
++
++IActivationFactory *adaptive_source_factory = &adaptive_statics.IActivationFactory_iface;
+--- a/dlls/mfmediaengine/main.c	2026-11-13 15:05:02.306853953 -0300
++++ b/dlls/mfmediaengine/main.c	2026-11-13 15:05:02.308314192 -0300
+@@ -2973,6 +2973,30 @@
+     return hr;
+ }
+ 
++/* MF_MT_DEFAULT_STRIDE of the frame sink's current type, 0 when it has none */
++static LONG media_engine_sink_stride(struct media_engine *engine)
++{
++    IMFMediaTypeHandler *handler;
++    IMFStreamSink *stream;
++    IMFMediaType *type;
++    UINT32 stride = 0;
++
++    if (SUCCEEDED(video_frame_sink_query_iface(engine->presentation.frame_sink, &IID_IMFStreamSink, (void **)&stream)))
++    {
++        if (SUCCEEDED(IMFStreamSink_GetMediaTypeHandler(stream, &handler)))
++        {
++            if (SUCCEEDED(IMFMediaTypeHandler_GetCurrentMediaType(handler, &type)))
++            {
++                IMFMediaType_GetUINT32(type, &MF_MT_DEFAULT_STRIDE, &stride);
++                IMFMediaType_Release(type);
++            }
++            IMFMediaTypeHandler_Release(handler);
++        }
++        IMFStreamSink_Release(stream);
++    }
++    return (INT32)stride;
++}
++
+ static HRESULT media_engine_transfer_wic(struct media_engine *engine, IWICBitmap *bitmap,
+         const MFVideoNormalizedRect *src_mf_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+@@ -2982,10 +3006,13 @@
+     IMFMediaBuffer *media_buffer;
+     IWICBitmapLock *lock = NULL;
+     WICPixelFormatGUID format;
++    IMF2DBuffer *buffer2d;
++    LONG stride_hint, pitch;
+     IMFSample *sample;
+     WICRect wic_rect;
+     BYTE *dst, *src;
+     HRESULT hr;
++    int y;
+ 
+     frame_width = engine->video_frame.size.cx;
+     frame_height = engine->video_frame.size.cy;
+@@ -3016,7 +3043,7 @@
+ 
+     if (!video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
+         return MF_E_UNEXPECTED;
+-    hr = IMFSample_ConvertToContiguousBuffer(sample, &media_buffer);
++    hr = IMFSample_GetBufferByIndex(sample, 0, &media_buffer);
+     IMFSample_Release(sample);
+     if (FAILED(hr))
+         return hr;
+@@ -3063,19 +3090,41 @@
+             || FAILED(hr = IWICBitmapLock_GetDataPointer(lock, &dst_size, &dst)))
+         goto done;
+ 
++    /* Rows as the window path reads them: a 2D buffer knows its own pitch and orientation; a plain buffer follows
++     * the sink type's MF_MT_DEFAULT_STRIDE, and RGB without one is bottom-up, as for a DIB. */
++    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(media_buffer, &IID_IMF2DBuffer, (void **)&buffer2d)))
++    {
++        if (SUCCEEDED(hr = IMF2DBuffer_Lock2D(buffer2d, &src, &pitch)))
++        {
++            for (y = 0; y < wic_rect.Height; y++)
++                memcpy(dst + y * dst_stride, src + (LONG)(src_rect.top + y) * pitch + src_rect.left * format_size,
++                        wic_rect.Width * format_size);
++            IMF2DBuffer_Unlock2D(buffer2d);
++        }
++        IMF2DBuffer_Release(buffer2d);
++        goto done;
++    }
++
+     if (FAILED(hr = IMFMediaBuffer_Lock(media_buffer, &src, &max_length, &current_length)))
+         goto done;
+ 
+-    if (current_length < frame_width * frame_height * format_size)
++    stride_hint = media_engine_sink_stride(engine);
++    src_stride = frame_width * format_size;
++    if ((UINT)abs(stride_hint) > src_stride) src_stride = abs(stride_hint);
++    if (current_length < src_stride * frame_height)
+     {
+         WARN("Unexpected source length %lu.\n", current_length);
++        IMFMediaBuffer_Unlock(media_buffer);
+         hr = MF_E_UNEXPECTED;
+         goto done;
+     }
+ 
+-    src_stride = frame_width * format_size;
+-    src += src_rect.top * src_stride + src_rect.left * format_size;
+-    MFCopyImage(dst, dst_stride, src, src_stride, dst_stride, wic_rect.Height);
++    for (y = 0; y < wic_rect.Height; y++)
++    {
++        UINT row = src_rect.top + y;
++        if (stride_hint <= 0) row = frame_height - 1 - row;
++        memcpy(dst + y * dst_stride, src + row * src_stride + src_rect.left * format_size, wic_rect.Width * format_size);
++    }
+ 
+     IMFMediaBuffer_Unlock(media_buffer);
+ 

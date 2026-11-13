@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1 - 2026-11-13
+
+- **Lightroom Classic's What's New videos play.** They showed "Unable to play this video. It requires a component that isn't available for this computer". Lightroom looks for Windows' media classes (MediaSource, AdaptiveMediaSource) before it plays them with its own player; Wine now has them, along with a working MediaPlayer for other apps. Patch 0147, plus a DXVK patch that adds `CreateDirect3D11SurfaceFromDXGISurface`, which Lightroom imports. Test: tests/mf/mfwinrt.c. Checked in the other 2027 apps (Home screens, What's New, Learn, After Effects' Cineware): none of them use these classes, and all still work.
+
 ## 0.6.0 - 2026-11-13
 
 - **After Effects 2027 starts reliably.** It crashed at most starts: while After Effects changes the language settings from several threads during startup, Wine's number reading (strtod, sscanf) could use settings another thread had just freed. Patch 0146.
