@@ -6,6 +6,7 @@ pkgbase = adobewine-bin
 	arch = x86_64
 	license = LGPL-2.1-or-later
 	depends = desktop-file-utils
+	depends = shared-mime-info
 	depends = fontconfig
 	depends = freetype2
 	depends = libgcc
@@ -42,6 +43,6 @@ pkgbase = adobewine-bin
 	options = !strip
 	options = !debug
 	source = https://github.com/le-birnes/LinDobe/releases/download/v0.6.0/adobewine-0.6.0-x86_64.tar.zst
-	sha256sums = 3ac922456ff3f963464db2bf399dae0ec11162e0658b92508e0b215bc93e3d87
+	sha256sums = eca2861c0f4aa6afb9f58982c2a54fae1db4f8e84e8a6559c2a244c7e4064779
 
 pkgname = adobewine-bin
