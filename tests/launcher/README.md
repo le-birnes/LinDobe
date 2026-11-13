@@ -20,3 +20,9 @@ MIME discovery and dispatches a synthetic `misterhorsepm:` callback through
 GIO's desktop-entry parser to stub Wine. It covers custom prefixes, quoting,
 idempotent registration, the configured Flatpak command and launcher removal.
 It does not start a browser, contact Mister Horse or run a Flatpak sandbox.
+
+With `shared-mime-info` installed, the suite also registers the native document
+types in `config/adobewine.xml` and dispatches project files through GIO to stub
+Wine. It checks uppercase extensions, argument boundaries, the configured
+Flatpak command, installed-app discovery, registration/removal and preservation
+of explicit application preferences. See [file associations](../../docs/FILE-ASSOCIATIONS.md).

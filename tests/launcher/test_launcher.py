@@ -44,6 +44,20 @@ from gi.repository import Gio
 if sys.argv[1] == 'default':
     app = Gio.AppInfo.get_default_for_uri_scheme('misterhorsepm')
     print(app.get_id() if app else '')
+elif sys.argv[1] == 'files':
+    import json
+    results = []
+    for path in sys.argv[2:]:
+        file = Gio.File.new_for_path(path)
+        mime = file.query_info('standard::content-type', Gio.FileQueryInfoFlags.NONE).get_content_type()
+        app = Gio.AppInfo.get_default_for_type(mime, False)
+        results.append([mime, app.get_id() if app else None])
+    print(json.dumps(results))
+elif sys.argv[1] == 'launch-file':
+    file = Gio.File.new_for_path(sys.argv[2])
+    mime = file.query_info('standard::content-type', Gio.FileQueryInfoFlags.NONE).get_content_type()
+    app = Gio.AppInfo.get_default_for_type(mime, False)
+    assert app is not None and app.launch([file], None)
 else:
     app = Gio.DesktopAppInfo.new_from_filename(sys.argv[1])
     assert app is not None and app.supports_uris()
@@ -58,7 +72,7 @@ class LauncherTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.source = self.root / 'source'
         for relative in ('bin/env.sh', 'bin/app-catalog.sh', 'bin/adobewine',
-                         'config/apps.txt', 'scripts/install-launchers.sh'):
+                         'config/apps.txt', 'config/adobewine.xml', 'scripts/install-launchers.sh'):
             target = self.source / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / relative, target)
@@ -174,8 +188,8 @@ class LauncherTests(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, check=True, timeout=10)
 
     def install_handler(self):
-        if not shutil.which('update-desktop-database'):
-            self.skipTest('desktop-file-utils is needed for MIME registration checks')
+        if not all(shutil.which(name) for name in ('update-desktop-database', 'update-mime-database')):
+            self.skipTest('desktop-file-utils and shared-mime-info are needed for MIME checks')
         self.run_script('scripts/install-launchers.sh')
         handler = self.apps / 'adobewine-misterhorse.desktop'
         subprocess.run(['desktop-file-validate', str(handler)], check=True, capture_output=True)
@@ -238,6 +252,121 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.gio('default').stdout.strip(), 'other-manager.desktop')
         self.run_script('scripts/install-launchers.sh', '--remove')
         self.assertEqual(preferences.read_text(), contents)
+
+    def install_native_apps(self, commands):
+        for line in (self.source / 'config/apps.txt').read_text().splitlines():
+            command, _, folder, executable, _, _ = line.split('|')
+            if command in commands:
+                path = self.prefix / 'drive_c/Program Files/Adobe' / folder.replace('{year}', '2026') / executable
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+        self.install_handler()
+        for handler in self.apps.glob('adobewine-*.desktop'):
+            subprocess.run(['desktop-file-validate', str(handler)], check=True, capture_output=True)
+
+    def native_files(self):
+        extensions = {
+            'photoshop': ('psd', 'psb', 'psdt'),
+            'illustrator': ('ai', 'ait'),
+            'aftereffects': ('aep', 'aepx', 'aet'),
+            'premiere': ('prproj',),
+            'audition': ('sesx',),
+            'indesign': ('indd', 'indt', 'indb', 'indl', 'idml', 'idap'),
+            'incopy': ('icml', 'icmt', 'icma', 'icap'),
+            'animate': ('fla', 'xfl'),
+            'lightroomclassic': ('lrcat',),
+        }
+        files = {}
+        for command, suffixes in extensions.items():
+            for suffix in suffixes:
+                path = self.root / f"Client's project & review.{suffix}"
+                path.write_bytes(b'<?xml version="1.0"?><project/>')
+                files[path] = command
+        return files
+
+    def test_native_formats_are_recognized_and_associated_with_installed_apps(self):
+        files = self.native_files()
+        self.install_native_apps(set(files.values()))
+        for path in list(files):
+            uppercase = path.with_suffix(path.suffix.upper())
+            uppercase.write_bytes(path.read_bytes())
+            files[uppercase] = files[path]
+        results = json.loads(self.gio('files', *files).stdout)
+        for path, (mime, handler) in zip(files, results):
+            with self.subTest(file=path.name):
+                self.assertNotIn(mime, ('text/plain', 'application/xml', 'application/octet-stream'))
+                self.assertEqual(handler, f'adobewine-{files[path]}.desktop')
+        self.assertFalse((Path(self.env['XDG_CONFIG_HOME']) / 'mimeapps.list').exists())
+
+    def test_file_manager_dispatch_preserves_project_path(self):
+        files = self.native_files()
+        self.install_native_apps(set(files.values()))
+        for path, command in files.items():
+            with self.subTest(file=path.name):
+                before = len(self.calls('wine'))
+                self.gio('launch-file', path)
+                deadline = time.monotonic() + 5
+                while len(self.calls('wine')) < before + 2 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                call = self.calls('wine')[-1]
+                entry = next(line.split('|') for line in (self.source / 'config/apps.txt').read_text().splitlines()
+                             if line.startswith(command + '|'))
+                executable = 'C:\\Program Files\\Adobe\\' + '/'.join(
+                    (entry[2].replace('{year}', '2026'), entry[3])).replace('/', '\\')
+                self.assertEqual(call[1][0], executable)
+                self.assertEqual(call[1][-1], 'Z:' + str(path).replace('/', '\\'))
+        self.assert_not_killed()
+
+    def test_flatpak_command_receives_native_project(self):
+        self.env['ADOBEWINE_EXEC'] = 'flatpak run --command=adobewine io.github.le_birnes.AdobeWine'
+        self.install_native_apps({'aftereffects'})
+        project = self.root / "Client's project & review.aep"
+        project.write_text('test')
+        self.gio('launch-file', project)
+        deadline = time.monotonic() + 5
+        while len(self.calls('wine')) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.calls('flatpak')[0][1],
+                         ['run', '--command=adobewine', 'io.github.le_birnes.AdobeWine',
+                          'aftereffects', str(project)])
+        self.assertEqual(self.calls('wine')[-1][1][-1], 'Z:' + str(project).replace('/', '\\'))
+
+    def test_native_registration_preserves_preferences_and_removes_only_owned_types(self):
+        self.install_native_apps({'aftereffects', 'indesign'})
+        preferences = Path(self.env['XDG_CONFIG_HOME']) / 'mimeapps.list'
+        other = self.apps / 'other-editor.desktop'
+        other.write_text('[Desktop Entry]\nType=Application\nName=Other Editor\nExec=true %F\n'
+                         'MimeType=application/x-aftereffects;application/pdf;text/plain;\n')
+        contents = ('[Default Applications]\napplication/x-aftereffects=other-editor.desktop;\n'
+                    'application/pdf=other-editor.desktop;\ntext/plain=other-editor.desktop;\n')
+        preferences.write_text(contents)
+        package = self.data / 'mime/packages/unrelated.xml'
+        package.write_text('<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">'
+                           '<mime-type type="application/x-unrelated">'
+                           '<glob pattern="*.unrelated"/></mime-type></mime-info>')
+        self.run_script('scripts/install-launchers.sh')
+        source = self.data / 'mime/packages/adobewine.xml'
+        registered = source.read_bytes()
+        self.run_script('scripts/install-launchers.sh')
+        self.assertEqual(source.read_bytes(), registered)
+        self.assertEqual(preferences.read_text(), contents)
+        project = self.root / 'Project.aep'
+        project.write_text('test')
+        self.assertEqual(json.loads(self.gio('files', project).stdout)[0][1], other.name)
+        self.run_script('scripts/install-launchers.sh', '--remove')
+        self.assertFalse(source.exists())
+        self.assertTrue(package.exists())
+        self.assertEqual(preferences.read_text(), contents)
+        self.assertNotIn('*.aep', (self.data / 'mime/globs2').read_text())
+        self.assertIn('*.unrelated', (self.data / 'mime/globs2').read_text())
+
+    def test_uninstalled_apps_are_not_advertised_as_handlers(self):
+        self.install_native_apps({'aftereffects'})
+        files = self.native_files()
+        results = json.loads(self.gio('files', *files).stdout)
+        for path, (_, handler) in zip(files, results):
+            expected = 'adobewine-aftereffects.desktop' if files[path] == 'aftereffects' else None
+            self.assertEqual(handler, expected)
 
 
 if __name__ == '__main__':

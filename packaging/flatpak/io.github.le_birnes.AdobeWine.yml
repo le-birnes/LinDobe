@@ -25,6 +25,7 @@ finish-args:
   - --filesystem=/mnt
   - --filesystem=xdg-data/applications:create   # `adobewine launchers`: the apps in the desktop menu
   - --filesystem=xdg-data/icons:create
+  - --filesystem=xdg-data/mime:create
   - --talk-name=org.freedesktop.Notifications
   - --env=ADOBEWINE_LINK_DLLS=1       # setup links Wine's own DLLs into the prefix (read-only /app): saves ~1.8 GB per user
   - --env=ADOBEWINE_EXEC=flatpak run --command=adobewine io.github.le_birnes.AdobeWine

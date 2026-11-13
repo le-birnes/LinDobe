@@ -5,12 +5,20 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")/.." && pwd)/bin/env.sh"
 APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps"
+MIME="${XDG_DATA_HOME:-$HOME/.local/share}/mime"
 if [ "${1:-}" = --remove ]; then
   rm -f "$APPS"/adobewine-*.desktop "$ICONS"/adobewine-*.png
+  if [ -f "$MIME/packages/adobewine.xml" ]; then
+    rm -f "$MIME/packages/adobewine.xml"
+    update-mime-database "$MIME"
+  fi
   update-desktop-database "$APPS" 2>/dev/null || true
   echo "launchers removed"; exit 0
 fi
 mkdir -p "$APPS" "$ICONS"
+mkdir -p "$MIME/packages"
+install -m644 "$ADOBEWINE_SRC/config/adobewine.xml" "$MIME/packages/adobewine.xml"
+update-mime-database "$MIME"
 # What the menu entries run: this checkout's launcher, or the Flatpak's ("flatpak run --command=adobewine <id>").
 EXEC="${ADOBEWINE_EXEC:-$ADOBEWINE_SRC/bin/adobewine}"
 desktop_arg() {

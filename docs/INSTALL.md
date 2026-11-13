@@ -185,6 +185,9 @@ adobewine launchers        # adds them to your desktop's application menu
 adobewine photoshop        # or illustrator, premiere, audition, encoder, cc
 ```
 
+`adobewine launchers` also registers native project and session
+[file associations](FILE-ASSOCIATIONS.md), preserving your default-application preferences.
+
 To close everything cleanly (the apps may ask to save): `adobewine off`.
 
 ## Updating LinDobe

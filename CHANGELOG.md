@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Native Adobe projects are recognized by the file manager.** `adobewine launchers` now registers MIME extension rules and handlers for After Effects, Premiere Pro, Audition sessions, InDesign, InCopy, Animate and Lightroom Classic, plus missing Photoshop and Illustrator native extensions. Existing default-application preferences are preserved. Rerun `adobewine launchers` after updating; no Wine rebuild is needed. See [file associations](docs/FILE-ASSOCIATIONS.md).
+
 - **Illustrator no longer freezes when a dropped file opens a dialog.** Dragging an .ai file with missing fonts from the file manager into Illustrator showed the "Missing Fonts" dialog, but it took no clicks or keys and Illustrator used a full CPU core until killed. Wine handled no X events while the drop was being delivered, so a dialog opened during the drop never got any input. Patch 0143. Contributed in #43.
 
 - **Photoshop's Type Context Bar shows the font and size again, and its font picker selects the row under the cursor.** Patches 0141 and 0142. Contributed in #42.
