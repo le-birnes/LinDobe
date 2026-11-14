@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **After Effects offers Advanced 3D on Intel and AMD graphics.** It said "Advanced 3D is not supported by the current hardware" and kept Classic 3D, because Wine's OpenCL could not share Direct3D 11 resources, which After Effects needs when it has no CUDA. Patches 0178 and 0179, from the Neutron project (thank you), replace our 0127. Checked on an Intel Iris Xe: Advanced 3D is accepted and draws in the viewer and in rendered frames; Premiere is unchanged. NVIDIA is unaffected.
+
+- **Fixes ported from Neutron** (patches 0150-0177, credited in each patch, thank you): Acrobat's paragraph properties and readable comment text, Photoshop combo lists that no longer pick an item on the press that opens them (Color Settings), Bridge font links and menu shortcut columns, a Lightroom crash from file descriptors past 1024, menu and dark-palette readability, MSI rollback and product enumeration, WinINet redirects and timeouts, the WMI asynchronous sink server (unsecapp), and more. Acrobat, Photoshop, Illustrator and Bridge test suites pass.
+
+- **Mister Horse Product Manager draws its tabs correctly, and Adobe UPIA can install Premiere UXP plugins.** Patches 0148 and 0149. Contributed in #52.
+
 ## 0.6.1 - 2026-11-13
 
 - **Lightroom Classic's What's New videos play.** They showed "Unable to play this video. It requires a component that isn't available for this computer". Lightroom looks for Windows' media classes (MediaSource, AdaptiveMediaSource) before it plays them with its own player; Wine now has them, along with a working MediaPlayer for other apps. Patch 0147, plus a DXVK patch that adds `CreateDirect3D11SurfaceFromDXGISurface`, which Lightroom imports. Test: tests/mf/mfwinrt.c. Checked in the other 2027 apps (Home screens, What's New, Learn, After Effects' Cineware): none of them use these classes, and all still work.

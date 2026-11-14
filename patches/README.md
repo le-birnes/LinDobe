@@ -86,6 +86,7 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
 - 0127 (2026-11-05): new (opencl: clGetExtensionFunctionAddressForPlatform returns clGetDeviceIDsFromD3D11KHR, which
   lists the platform's GPU devices on the D3D11 adapter's vendor; clCreateContext drops CL_CONTEXT_D3D11_DEVICE_KHR. No
   object sharing). Premiere's Intel OpenCL path looks its device up this way.
+  Replaced on 2026-11-14 by 0178-0179, which do the full sharing.
 - 0128 (2026-11-05): new (dxcore: adapters from the GPUs Wine registers, with their name, PCI ids, LUID and driver
   version, instead of wined3d's identifier, which said "Intel(R) HD Graphics 4000" with a 2013 driver when wined3d had
   no GL; wined3d stays the fallback).
@@ -177,3 +178,44 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
   _isspace_l(c, NULL) refetched the thread locale and freed the old one after another thread's setlocale, and the
   caller kept using freed memory: After Effects 2027 crashed at most starts in fpnum_parse_bnum.
   tests/locale/localerace.c: page fault before, PASS after; After Effects 2027 5 of 5 clean starts.
+- 0148 (2026-11-14, #52): dxgi Present1 on D3D11 composition swapchains keeps the previous frame outside the dirty
+  rectangles. Mister Horse Product Manager mixed its After Effects and Premiere tabs. Test: tests/dxgi/dirty-composition.c.
+- 0149 (2026-11-14, #52): wine.inf sets CommonW6432Dir in the native 64-bit CurrentVersion key (a custom value is kept).
+  Adobe UPIA needs it to install Premiere UXP plugins. Test: tests/misterhorse/native-common-files.c.
+- 0150-0177 (2026-11-14): ported from Neutron (github.com/Nico-LaFoucate/neutron-wine, release-187, LGPL-2.1+). Each
+  patch keeps Neutron's header, credit and kill switch. Checked hunk by hunk that each block lands where Neutron put it;
+  0168 rebased by hand (Wine 11.20 has no para_get_reole), 0177 placed by hand.
+  - 0150: win32u: blend premultiplied pixels four at a time, skipping transparent and opaque ones
+  - 0151: crypt32: verify a signer's authenticated attributes over the bytes it signed
+  - 0152: user32: a readable outline for check boxes and radio buttons when the palette's 3D ring has none
+  - 0153: keyboard layout handles (HKL) are sign-extended from 32 bits, as on Windows
+  - 0154: mshtml: zoom on the top document's body or root element zooms the page
+  - 0155: win32u: with flat menus a grayed item is drawn once in COLOR_GRAYTEXT
+  - 0156: win32u: after Escape, a click on another menu-bar item opens it
+  - 0157: ntdll: Wine's own file descriptors at 1024 and up, so a host library's select() never sees one past
+    FD_SETSIZE (a Lightroom crash)
+  - 0158: dwrite: lock the shared GDI interop object across threads
+  - 0159: win32u, server: an owned window stays in its owner's topmost band (a dialog under another dialog)
+  - 0160: msi: MsiEnumProductsEx on squashed GUIDs (an installer hang)
+  - 0161: wininet: a redirect keeps the connect handle's settings (400 after a CDN redirect)
+  - 0162: win32u: measure menu bar items through WM_UAHMEASUREMENUITEM
+  - 0163: kernelbase: an overlapped TransactNamedPipe returns STATUS_PENDING
+  - 0164: wininet: receive timeouts as Windows 11 reports and times them
+  - 0165: win32u: font links reach a family that is present only as a replacement (Bridge)
+  - 0166: win32u: a popup menu's shortcut column is measured from where its labels are drawn
+  - 0167: win32u: GetFontData on a font collection member covers member offset to end of file
+  - 0168: riched20: the ITextPara property getters (Acrobat)
+  - 0169: riched20: auto-coloured text stays readable on a background the app chose (Acrobat comments)
+  - 0170: programs/unsecapp: the Unsecured Apartment server (WMI asynchronous sinks); includes the two configure lines,
+    so no autoreconf is needed
+  - 0171: msi: roll back only what the failed install did to files, folders and component registration
+  - 0172: comctl32, user32: the press that drops a combo list never picks an item (Photoshop's Color Settings lists)
+  - 0174: win32u: WM_IME_SETCONTEXT reaches a focus window of another process
+  - 0175: msvcrt: __CxxRegisterExceptionObject ends "processing a throw", as Windows does
+  - 0176: user32: disabled text stays readable when the palette's emboss is invisible
+  - 0177: win32u: when the active window goes away, the window active before it is activated
+  Checked on 2026-11-14 with the Acrobat (37 checks), Photoshop (10/10), Illustrator (4/4) and Bridge suites.
+- 0178-0179 (2026-11-14): Neutron's OpenCL cl_khr_d3d11_sharing and its host-buffer copies (their patches 135 and 137),
+  replacing 0127. After Effects on Intel and AMD graphics gets Advanced 3D: on an Intel Iris Xe it no longer says
+  "Advanced 3D is not supported by the current hardware", and the Advanced 3D renderer draws in the viewer and in
+  rendered frames. Premiere's GPU check and test suite are unchanged (7/7). NVIDIA is unaffected (After Effects uses CUDA there).
