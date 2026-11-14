@@ -30,3 +30,20 @@ After Effects 26.5.0.89 reports save/reopen and render PASS, with three enabled
 expressions. The output contains 72 frames, 21 distinct frame hashes, and the
 same per-frame hashes as the earlier render. The user confirms stable viewer
 display and normal panel mouse interaction with patch 0136.
+
+## Native common-files directory
+
+`native-common-files.c` checks that a fresh 64-bit prefix provides the native
+`CommonW6432Dir` alias expected by Adobe UPIA, matching `CommonFilesDir` in the
+64-bit registry view. It reads only those two directory values. A deliberately
+customized alias may differ and is outside this default-prefix comparison.
+
+```sh
+x86_64-w64-mingw32-gcc -O1 -Wall -Werror -o native-common-files.exe \
+  tests/misterhorse/native-common-files.c -ladvapi32
+```
+
+Run in a disposable prefix with an explicit runtime. The original Wine 11.20
+registry initialization omits the alias; patch 0149 adds it without overwriting
+an existing value. Existing prefixes need a Wine prefix update (`wineboot -u`)
+from the patched runtime. This test installs no plugin and reads no account data.

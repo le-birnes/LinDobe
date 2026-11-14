@@ -5,14 +5,17 @@ same LinDobe prefix as After Effects. Browser login, preset application,
 playback, saving, reopening and a short render passed first in an isolated
 prefix, then in the normal prefix with a runtime built from main.
 
-This is experimental support for the versions below. Other plugin vendors,
-Premiere plugin workflows and Windows reference comparison were not tested.
+This is experimental support for the versions below. Other plugin vendors remain
+untested. The initial investigation did not test Premiere plugin workflows or
+a Windows reference. The later Premiere investigation is described below.
 
 ## Install and sign in
 
 Use a LinDobe runtime containing patches **0134, 0135 and 0136**, built for
 your CPU. The original 0.5.5 runtime does not contain these three patches;
-the package version alone does not establish that they are included.
+the package version alone does not establish that they are included. The later
+Product Manager redraw and Premiere installation corrections additionally require
+**0148/0149** and the launcher changes described in the follow-up section.
 
 1. Prepare LinDobe normally with `adobewine setup` and `adobewine launchers`.
    When upgrading an existing installation, run these commands from the version
@@ -50,8 +53,10 @@ the package version alone does not establish that they are included.
 entry forwards one URI through the existing `adobewine run` command, preserving
 the prefix and LinDobe home used to generate it. It also honors `ADOBEWINE_EXEC`
 for the configured Flatpak command. There is no new plugin-manager command.
-The handler is hidden from the application menu and does not replace existing
-MIME preferences. If another application already handles this scheme, select
+The entry is hidden from the application menu until Product Manager is installed;
+rerun `adobewine launchers` after installing it to show it in the menu. The same
+entry handles browser callbacks and does not replace existing MIME preferences.
+If another application already handles this scheme, select
 the LinDobe handler in the browser's application chooser.
 
 Product Manager must use the default installer location,
@@ -155,6 +160,77 @@ general multi-API composition implementation or a Windows conformance fix.
 The maintainer subsequently reported passing After Effects (5/5), Premiere
 (7/7), Photoshop (10/10) and standalone regression (28/28) suites with the three
 patches in [the merged contribution](https://github.com/le-birnes/LinDobe/pull/33).
+
+## Product Manager and Premiere follow-up (2026-11-14)
+
+Product Manager 3.7.7 exhibited two additional problems on the official 0.6.1
+runtime: switching between its After Effects and Premiere tabs mixed old and
+new content, and installing Animation Composer for Premiere failed in UPIA.
+
+### Partial composition updates
+
+Product Manager uses `IDXGISwapChain1::Present1` with one or more dirty
+rectangles. Wine ignored those parameters and presented the whole rotating
+back buffer, including stale pixels outside the regions JUCE had redrawn.
+Patch **0148** retains the previous composition, updates its dirty regions,
+and copies the composed frame into the current back buffer before presenting.
+A full `Present` or `Present1` replaces that history; successful `ResizeBuffers`
+discards it. A rejected resize leaves it intact.
+
+This path applies only to Wine's D3D11 composition swapchains, using one
+additional device texture per swapchain. Ordinary HWND swapchains, DXVK and
+D3D12 presentation keep their existing paths. Scroll rectangles retain their
+previous unsupported behavior and reset the retained history. The observed
+Product Manager calls contained no scroll parameters.
+
+The standalone reproducer fails on 0.6.1 and passes with patch 0148 using two
+and three back buffers, multiple dirty rectangles, alternating `Present` and
+`Present1`, and both successful and rejected resizing. Ordinary HWND full-frame
+presentation also passes. The user confirmed that tab switching, hovering and
+window resizing no longer flicker on Hyprland/XWayland. KDE and Windows
+reference runs remain pending.
+
+The expected dirty-region behavior is described in Microsoft's
+[DXGI presentation documentation](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/dxgi-1-2-presentation-improvements).
+
+### Premiere UXP installation
+
+The captured official package is Animation Composer for Premiere **2.2.3**,
+plugin ID `com.misterhorse.animationcomposer.premiere.uxp`. Its manifest
+requires Premiere 25.1.0 or later; the installed host is **26.5.2**.
+Two independent path issues prevented the vendor installer from completing:
+
+- From a Linux working directory on Wine's Z: drive, UPIA drops the drive
+  letter from a user-data path while preparing directories and returns `-198`.
+  The launcher now starts only the default installed Product Manager from its
+  prefix's C: drive. File arguments are resolved before changing directory.
+- Once that error is avoided, UPIA queries `CommonW6432Dir` in the native
+  64-bit `HKLM\Software\Microsoft\Windows\CurrentVersion` key. Wine omits
+  this value, and UPIA returns `-1` while constructing its common UXP path.
+  Patch **0149** initializes the value from Wine's native common-files folder
+  in the AMD64 and ARM64 registry sections. An existing customized value is
+  preserved; both a fresh prefix and upgrading an older prefix passed, including
+  preservation of a deliberately customized alias during `wineboot -u`. Microsoft
+  shows the alias in its
+  [CurrentVersion registry example](https://learn.microsoft.com/en-us/powershell/scripting/samples/working-with-registry-entries).
+
+With the native path present and a C: working directory, the unmodified official
+UPIA reports a successful installation. The installed manifest was verified in
+`C:\Program Files\Common Files\Adobe\UXP\Plugins\External`.
+The user confirmed the installed status in Product Manager and successfully
+opened the plugin panel in Premiere, where it appeared under **Extensions**.
+
+[Adobe's UPIA instructions](https://developer.adobe.com/premiere-pro/uxp/plugins/distribution/install/)
+also run the Windows installer from its installed C: directory. The integration
+uses the normal vendor installer and its validation. No plugin extraction or
+manual database population is part of the correction.
+
+Reproducers:
+
+- `tests/dxgi/dirty-composition.c` and its README.
+- `tests/misterhorse/native-common-files.c` checks the native registry aliases.
+- `tests/launcher` checks Product Manager visibility, callbacks, working directory
+  and preservation of relative file arguments; 21 tests pass.
 
 ## Acceptance evidence
 

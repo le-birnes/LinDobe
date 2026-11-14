@@ -19,6 +19,8 @@ name = pathlib.Path(sys.argv[0]).name
 args = sys.argv[1:]
 with (root / 'calls.jsonl').open('a') as f:
     f.write(json.dumps([name, args, os.environ['WINEPREFIX'], os.environ['ADOBEWINE_HOME']]) + '\\n')
+if name == 'wine':
+    (root / 'wine-cwd').write_text(os.getcwd())
 if name == 'wine' and args == ['tasklist']:
     counter = root / 'tasks'
     count = int(counter.read_text()) + 1 if counter.exists() else 1
@@ -44,6 +46,10 @@ from gi.repository import Gio
 if sys.argv[1] == 'default':
     app = Gio.AppInfo.get_default_for_uri_scheme('misterhorsepm')
     print(app.get_id() if app else '')
+elif sys.argv[1] == 'visible':
+    app = Gio.DesktopAppInfo.new_from_filename(sys.argv[2])
+    assert app is not None
+    print(app.should_show())
 elif sys.argv[1] == 'files':
     import json
     results = []
@@ -205,21 +211,51 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(calls[0][1], [str(self.prefix / 'drive_c/Program Files/'
                                         'Mister Horse Product Manager/ProductManager.exe'), URI])
         self.assertEqual(calls[0][2:], [str(self.prefix), str(self.home)])
+        self.assertEqual((self.state / 'wine-cwd').read_text(), str(self.prefix / 'drive_c'))
         self.assertEqual(self.calls('sleep'), [])
         self.assert_not_killed()
 
     def test_protocol_is_available_before_install_and_registration_is_idempotent(self):
         handler = self.install_handler()
         self.assertEqual(self.gio('default').stdout.strip(), handler.name)
+        self.assertEqual(self.gio('visible', handler).stdout.strip(), 'False')
         contents = handler.read_text()
         self.run_script('scripts/install-launchers.sh')
         self.assertEqual(handler.read_text(), contents)
         self.launch_handler(handler)
         self.assertFalse((Path(self.env['XDG_CONFIG_HOME']) / 'mimeapps.list').exists())
 
+    def test_installed_manager_is_visible_and_remains_uri_handler(self):
+        executable = self.prefix / 'drive_c/Program Files/Mister Horse Product Manager/ProductManager.exe'
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        handler = self.install_handler()
+        self.assertEqual(self.gio('visible', handler).stdout.strip(), 'True')
+        self.assertEqual(self.gio('default').stdout.strip(), handler.name)
+        self.launch_handler(handler)
+        executable.unlink()
+        self.install_handler()
+        self.assertEqual(self.gio('visible', handler).stdout.strip(), 'False')
+
+    def test_manager_uses_c_drive_and_preserves_relative_file_arguments(self):
+        programs = [r'C:\Program Files\Mister Horse Product Manager\ProductManager.exe',
+                    'c:/PROGRAM FILES/Mister Horse Product Manager/ProductManager.exe',
+                    str(self.prefix / 'drive_c/Program Files/Mister Horse Product Manager/ProductManager.exe')]
+        project = Path(os.path.relpath(self.file))
+        for program in programs:
+            with self.subTest(program=program):
+                self.run_script('bin/adobewine', 'run', program, project)
+                self.assertEqual((self.state / 'wine-cwd').read_text(), str(self.prefix / 'drive_c'))
+                self.assertEqual(self.calls('wine')[-1][1][-1], 'Z:' + str(project.resolve()).replace('/', '\\'))
+
+    def test_other_programs_keep_the_callers_working_directory(self):
+        self.run_script('bin/adobewine', 'run', r'C:\Other\ProductManager.exe')
+        self.assertEqual((self.state / 'wine-cwd').read_text(), os.getcwd())
+
     def test_callback_preserves_custom_prefix_and_quoted_arguments(self):
         self.prefix = self.root / 'préfixe % " $ ` \\ & space'
         self.env['WINEPREFIX'] = str(self.prefix)
+        (self.prefix / 'drive_c').mkdir(parents=True)
         self.launch_handler(self.install_handler())
 
     def test_flatpak_command_receives_callback(self):
