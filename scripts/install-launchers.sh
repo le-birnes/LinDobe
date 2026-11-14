@@ -70,14 +70,18 @@ Categories=Utility;
 EOF
 # Register before Product Manager is installed, so a later browser login needs no manual association.
 PM_EXEC="${ADOBEWINE_EXEC:-$(desktop_arg "$ADOBEWINE_SRC/bin/adobewine")}"
+PM_EXE="$WINEPREFIX/drive_c/Program Files/Mister Horse Product Manager/ProductManager.exe"
+PM_NODISPLAY=true
+if [ -f "$PM_EXE" ]; then PM_NODISPLAY=false; fi
 cat > "$APPS/adobewine-misterhorse.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Mister Horse Product Manager (LinDobe)
-Exec=env $(desktop_arg "WINEPREFIX=$WINEPREFIX") $(desktop_arg "ADOBEWINE_HOME=$ADOBEWINE_HOME") $PM_EXEC run $(desktop_arg "$WINEPREFIX/drive_c/Program Files/Mister Horse Product Manager/ProductManager.exe") %u
+Exec=env $(desktop_arg "WINEPREFIX=$WINEPREFIX") $(desktop_arg "ADOBEWINE_HOME=$ADOBEWINE_HOME") $PM_EXEC run $(desktop_arg "$PM_EXE") %u
 Icon=application-x-executable
 Terminal=false
-NoDisplay=true
+Categories=Utility;
+NoDisplay=$PM_NODISPLAY
 MimeType=x-scheme-handler/misterhorsepm;
 StartupWMClass=productmanager.exe
 EOF

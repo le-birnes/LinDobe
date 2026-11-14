@@ -1,0 +1,182 @@
+Subject: [PATCH] dxgi: Preserve composition content outside present dirty rectangles.
+
+Wine's composition path presents the whole rotating back buffer while Present1
+ignores its dirty rectangles. JUCE renders only those rectangles, leaving
+stale content from earlier frames elsewhere in the buffer. Mister Horse
+Product Manager consequently mixes its After Effects and Premiere tabs.
+
+Retain the previous composition in a device texture. Merge the updated regions
+into it and copy the complete result to the current back buffer before present.
+Full presents replace the history; successful buffer resizing discards it.
+Only D3D11 composition swapchains use this path. Scroll parameters retain their
+existing unsupported behavior and discard history before falling back.
+
+The standalone tests/dxgi/dirty-composition.c fails with the original runtime
+and passes with two and three buffers, multiple rectangles, ordinary Present,
+and successful and rejected resizing. The user confirmed that tab switching,
+hovering and window resizing no longer flicker in Product Manager 3.7.7 on
+Hyprland/XWayland. Windows and KDE reference runs are pending.
+
+---
+diff --git a/dlls/dxgi/dxgi_private.h b/dlls/dxgi/dxgi_private.h
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -187,6 +187,7 @@
+     LONG present_count;
+     LONG in_set_fullscreen_state;
+     HWND composition_window;
++    ID3D11Texture2D *present_history;
+ };
+ 
+ BOOL d3d11_swapchain_set_composition_window(IDXGISwapChain1 *iface, HWND window);
+diff --git a/dlls/dxgi/swapchain.c b/dlls/dxgi/swapchain.c
+--- a/dlls/dxgi/swapchain.c
++++ b/dlls/dxgi/swapchain.c
+@@ -267,6 +267,11 @@
+             WARN("Releasing fullscreen swapchain.\n");
+             IDXGIOutput_Release(swapchain->target);
+         }
++        if (swapchain->present_history)
++        {
++            ID3D11Texture2D_Release(swapchain->present_history);
++            swapchain->present_history = NULL;
++        }
+         IWineDXGIFactory_Release(swapchain->factory);
+         wined3d_swapchain_decref(swapchain->wined3d_swapchain);
+         IWineDXGIDevice_Release(device);
+@@ -331,8 +336,91 @@
+ 
+ /* IDXGISwapChain1 methods */
+ 
++static HRESULT d3d11_swapchain_compose_frame(struct d3d11_swapchain *swapchain,
++        const DXGI_PRESENT_PARAMETERS *parameters)
++{
++    ID3D11DeviceContext *context;
++    ID3D11Texture2D *buffer;
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Device *device;
++    HRESULT hr;
++    UINT i;
++
++    if (!swapchain->composition_window)
++        return S_OK;
++    if (parameters && (parameters->pScrollRect || parameters->pScrollOffset))
++    {
++        if (swapchain->present_history)
++        {
++            ID3D11Texture2D_Release(swapchain->present_history);
++            swapchain->present_history = NULL;
++        }
++        return S_OK;
++    }
++    if (parameters && parameters->DirtyRectsCount && !parameters->pDirtyRects)
++        return DXGI_ERROR_INVALID_CALL;
++    if (FAILED(hr = IWineDXGIDevice_QueryInterface(swapchain->device, &IID_ID3D11Device, (void **)&device)))
++        return hr;
++    hr = IDXGISwapChain4_GetBuffer(&swapchain->IDXGISwapChain4_iface, 0,
++            &IID_ID3D11Texture2D, (void **)&buffer);
++    if (FAILED(hr))
++    {
++        ID3D11Device_Release(device);
++        return hr;
++    }
++    ID3D11Device_GetImmediateContext(device, &context);
++    ID3D11Texture2D_GetDesc(buffer, &desc);
++    if (parameters)
++    {
++        for (i = 0; i < parameters->DirtyRectsCount; ++i)
++        {
++            const RECT *rect = &parameters->pDirtyRects[i];
++            if (rect->left < 0 || rect->top < 0 || rect->right < rect->left || rect->bottom < rect->top
++                    || (UINT)rect->right > desc.Width || (UINT)rect->bottom > desc.Height)
++            {
++                hr = DXGI_ERROR_INVALID_CALL;
++                goto done;
++            }
++        }
++    }
++    if (!swapchain->present_history)
++    {
++        desc.Usage = D3D11_USAGE_DEFAULT;
++        desc.BindFlags = 0;
++        desc.CPUAccessFlags = 0;
++        desc.MiscFlags = 0;
++        hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &swapchain->present_history);
++        if (FAILED(hr)) goto done;
++        if (parameters && parameters->DirtyRectsCount)
++            ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)swapchain->present_history,
++                    (ID3D11Resource *)buffer);
++    }
++    if (parameters && parameters->DirtyRectsCount)
++    {
++        for (i = 0; i < parameters->DirtyRectsCount; ++i)
++        {
++            const RECT *rect = &parameters->pDirtyRects[i];
++            D3D11_BOX box = {rect->left, rect->top, 0, rect->right, rect->bottom, 1};
++            ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)swapchain->present_history,
++                    0, rect->left, rect->top, 0, (ID3D11Resource *)buffer, 0, &box);
++        }
++        ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)buffer,
++                (ID3D11Resource *)swapchain->present_history);
++    }
++    else
++        ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)swapchain->present_history,
++                (ID3D11Resource *)buffer);
++    hr = S_OK;
++
++done:
++    ID3D11DeviceContext_Release(context);
++    ID3D11Texture2D_Release(buffer);
++    ID3D11Device_Release(device);
++    return hr;
++}
++
+ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+-        unsigned int sync_interval, unsigned int flags)
++        unsigned int sync_interval, unsigned int flags, const DXGI_PRESENT_PARAMETERS *parameters)
+ {
+     HWND target = NULL;
+     HRESULT hr;
+@@ -364,6 +452,9 @@
+         return S_OK;
+     }
+ 
++    if (FAILED(hr = d3d11_swapchain_compose_frame(swapchain, parameters)))
++        return hr;
++
+     if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, target, sync_interval, 0)))
+         InterlockedIncrement(&swapchain->present_count);
+     return hr;
+@@ -375,7 +466,7 @@
+ 
+     TRACE("iface %p, sync_interval %u, flags %#x.\n", iface, sync_interval, flags);
+ 
+-    return d3d11_swapchain_present(swapchain, sync_interval, flags);
++    return d3d11_swapchain_present(swapchain, sync_interval, flags, NULL);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetBuffer(IDXGISwapChain4 *iface,
+@@ -609,6 +700,11 @@
+     hr = wined3d_swapchain_resize_buffers(swapchain->wined3d_swapchain, buffer_count, width, height,
+             wined3d_desc.backbuffer_format, wined3d_desc.multisample_type,
+             wined3d_desc.multisample_quality, wined3d_desc.flags);
++    if (SUCCEEDED(hr) && swapchain->present_history)
++    {
++        ID3D11Texture2D_Release(swapchain->present_history);
++        swapchain->present_history = NULL;
++    }
+     /* wined3d_swapchain_resize_buffers() may recreate swapchain textures.
+      * We do not need to remove the reference to the wined3d swapchain from the
+      * old d3d11 textures: we just validated above that they have 0 references,
+@@ -768,10 +864,7 @@
+     TRACE("iface %p, sync_interval %u, flags %#x, present_parameters %p.\n",
+             iface, sync_interval, flags, present_parameters);
+ 
+-    if (present_parameters)
+-        FIXME("Ignored present parameters %p.\n", present_parameters);
+-
+-    return d3d11_swapchain_present(swapchain, sync_interval, flags);
++    return d3d11_swapchain_present(swapchain, sync_interval, flags, present_parameters);
+ }
+ 
+ static BOOL STDMETHODCALLTYPE d3d11_swapchain_IsTemporaryMonoSupported(IDXGISwapChain4 *iface)

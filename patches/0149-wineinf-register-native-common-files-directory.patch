@@ -1,0 +1,30 @@
+Subject: [PATCH] wine.inf: Register the native 64-bit common files directory.
+
+Adobe's Unified Plugin Installer Agent reads CommonW6432Dir directly from the
+64-bit CurrentVersion registry key. Wine registers CommonFilesDir but omits
+this native-directory alias, so UPIA cannot construct its UXP installation path
+and rejects the Premiere plugin with status -1 after the current-drive error
+has been avoided.
+
+Initialize the alias in the native AMD64 and ARM64 registry sections. Use the
+existing common-files directory ID and do not overwrite a customized value.
+This changes no program files location and installs no Adobe components.
+
+---
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -392,11 +392,13 @@
+ HKLM,%CurrentVersionNT%\Winlogon,"Shell",,"explorer.exe"
+ 
+ [CurrentVersionWow64.ntamd64]
++HKLM,%CurrentVersion%,"CommonW6432Dir",2,"%16427%"
+ HKLM,%CurrentVersion%,"ProgramFilesDir (x86)",,"%16426%"
+ HKLM,%CurrentVersion%,"CommonFilesDir (x86)",,"%16428%"
+ HKLM,Software\Microsoft\Wow64\x86,,2,"wow64cpu.dll"
+ 
+ [CurrentVersionWow64.ntarm64]
++HKLM,%CurrentVersion%,"CommonW6432Dir",2,"%16427%"
+ HKLM,%CurrentVersion%,"ProgramFilesDir (x86)",,"%16426%"
+ HKLM,%CurrentVersion%,"CommonFilesDir (x86)",,"%16428%"
+ HKLM,%CurrentVersion%,"ProgramFilesDir (Arm)",,"C:\Program Files (Arm)"

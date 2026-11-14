@@ -153,6 +153,11 @@ case "$cmd" in premiere|aftereffects|encoder) gpu_note ;; esac
 log="$ADOBEWINE_HOME/logs/$cmd-$(date +%Y%m%d-%H%M%S).log"
 echo "log: $log"
 start=$SECONDS
+program="${exe//\\//}"
+if [ "$exe" = "$WINEPREFIX/drive_c/Program Files/Mister Horse Product Manager/ProductManager.exe" ] ||
+   [ "${program,,}" = 'c:/program files/mister horse product manager/productmanager.exe' ]; then
+  cd "$WINEPREFIX/drive_c" || exit 1
+fi
 wine "$exe" "${args[@]}" > "$log" 2>&1
 rc=$?
 if [ "$(grep -c 'Failed to create Vulkan swapchain' "$log" 2>/dev/null)" -gt 20 ]; then
