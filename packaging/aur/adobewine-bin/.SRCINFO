@@ -1,6 +1,6 @@
 pkgbase = adobewine-bin
 	pkgdesc = LinDobe (prebuilt): Wine 11.20 with patches for Adobe Creative Cloud apps (Photoshop, Illustrator, Premiere Pro, Audition, Media Encoder)
-	pkgver = 0.6.2
+	pkgver = 0.6.3
 	pkgrel = 1
 	url = https://github.com/le-birnes/LinDobe
 	arch = x86_64
@@ -42,7 +42,7 @@ pkgbase = adobewine-bin
 	conflicts = adobewine
 	options = !strip
 	options = !debug
-	source = https://github.com/le-birnes/LinDobe/releases/download/v0.6.2/adobewine-0.6.2-x86_64.tar.zst
-	sha256sums = aa2f8d405fd905b29f9e2228cdd980b2c3319d2390284f9e7389242a15fb897c
+	source = https://github.com/le-birnes/LinDobe/releases/download/v0.6.3/adobewine-0.6.3-x86_64.tar.zst
+	sha256sums = 16f19c6891f96e1552fca599273648974d6ca7cc5a498fd150ef88c663dc2715
 
 pkgname = adobewine-bin
