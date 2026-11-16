@@ -1,0 +1,323 @@
+wintypes: ApiInformation's Is*Present queries answer instead of returning E_NOTIMPL.
+
+Lightroom (desktop, not Classic) 10.0 showed "(unknown C++ exception)" at every start, then "can only init the
+Organize Module once", and opened with a blank grey window and raw command IDs in the menus (public #56). Its ui.dll
+asks ApiInformation.IsTypePresent("Windows.Devices.Haptics.InputHapticsManager") during start-up; Wine's stub
+returned E_NOTIMPL, which C++/WinRT throws as hresult_not_implemented, and that aborts the Organize module. Found and
+traced by the reporter (+seh,+combase,+wintypes), who confirmed that FALSE + S_OK fixes it.
+
+On Windows these queries read the system metadata and never fail for a well-formed name. Wine has no metadata to read:
+- IsTypePresent: TRUE for a contract Wine lists as present (the table IsApiContractPresentByMajor already uses) and
+  for a runtime class registered under HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId (the classes Wine
+  can activate), FALSE for anything else, with S_OK.
+- IsMethodPresentWithArity, IsEventPresent, IsPropertyPresent, IsReadOnlyPropertyPresent, IsWriteablePropertyPresent,
+  IsEnumNamedValuePresent: FALSE with S_OK, as IsMethodPresent already does.
+- IsApiContractPresentByMajorAndMinor: same answer as IsApiContractPresentByMajor (minor version not checked).
+NULL names still return E_INVALIDARG.
+
+Test: tests/winrt/apiinfo.c (12 queries): runtime-11.20 FAIL 11 of 12 (hr 0x80004001), with the patch PASS.
+Wine's dlls/wintypes/tests: 31 todo_wine checks now succeed on Wine and are no longer marked; 1252 tests, 0 failures.
+Real app, signed-in Lightroom 10.0 (copy of the main prefix, hidden screen, RTX 4070): without the patch both error
+dialogs as reported; with it no dialog, All Photos, Albums, Cloud/Local tabs and menus drawn, and a new Local folder
+of 6 DNGs opened with thumbnails.
+
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index 2c5d4c4..2279946 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -43,6 +43,25 @@ static BOOLEAN is_api_contract_present( const HSTRING hname, unsigned int versio
+     return FALSE;
+ }
+ 
++/* Wine has no Windows metadata to search, so a type counts as present when it is a contract
++ * listed above or a runtime class registered for activation. Anything else is answered as absent. */
++static BOOLEAN is_type_present( const HSTRING hname )
++{
++    const WCHAR *name = WindowsGetStringRawBuffer( hname, NULL );
++    WCHAR path[512];
++    unsigned int i;
++    HKEY key;
++
++    for (i = 0; i < ARRAY_SIZE(present_contracts); ++i)
++        if (!wcsicmp( name, present_contracts[i].name )) return TRUE;
++
++    if (!name[0] || wcslen( name ) > ARRAY_SIZE(path) - 64) return FALSE;
++    swprintf( path, ARRAY_SIZE(path), L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\%s", name );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return FALSE;
++    RegCloseKey( key );
++    return TRUE;
++}
++
+ struct api_information_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+@@ -146,12 +165,13 @@ DEFINE_IINSPECTABLE(api_information_statics, IApiInformationStatics, struct api_
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsTypePresent(
+         IApiInformationStatics *iface, HSTRING type_name, BOOLEAN *value)
+ {
+-    FIXME("iface %p, type_name %s, value %p stub!\n", iface, debugstr_hstring(type_name), value);
++    FIXME("iface %p, type_name %s, value %p semi-stub.\n", iface, debugstr_hstring(type_name), value);
+ 
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = is_type_present( type_name );
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresent(
+@@ -178,7 +198,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresentWithArit
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
+@@ -190,7 +211,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
+@@ -202,7 +224,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPresent(
+@@ -215,7 +238,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPrese
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPresent(
+@@ -227,7 +251,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPres
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent(
+@@ -239,7 +264,8 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent
+     if (!enum_type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByMajor(
+@@ -259,13 +285,14 @@ static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByM
+         IApiInformationStatics *iface, HSTRING contract_name, UINT16 major_version,
+         UINT16 minor_version, BOOLEAN *value)
+ {
+-    FIXME("iface %p, contract_name %s, major_version %u, minor_version %u, value %p stub!\n", iface,
++    FIXME("iface %p, contract_name %s, major_version %u, minor_version %u, value %p semi-stub.\n", iface,
+             debugstr_hstring(contract_name), major_version, minor_version, value);
+ 
+     if (!contract_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    *value = is_api_contract_present( contract_name, major_version );
++    return S_OK;
+ }
+ 
+ static const struct IApiInformationStaticsVtbl api_information_statics_vtbl =
+diff --git a/dlls/wintypes/tests/wintypes.c b/dlls/wintypes/tests/wintypes.c
+index 66a6567..43373a7 100644
+--- a/dlls/wintypes/tests/wintypes.c
++++ b/dlls/wintypes/tests/wintypes.c
+@@ -518,7 +518,6 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsTypePresent(statics, str, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsTypePresent failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE, "IsTypePresent returned FALSE.\n");
+@@ -558,23 +557,17 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsMethodPresentWithArity(statics, str, NULL, 1, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsMethodPresentWithArity failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsMethodPresentWithArity returned FALSE.\n");
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsMethodPresentWithArity(statics, str, str2, 0, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsMethodPresentWithArity failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsMethodPresentWithArity returned FALSE.\n");
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsMethodPresentWithArity(statics, str, str2, 2, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsMethodPresentWithArity failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsMethodPresentWithArity returned FALSE.\n");
+ 
+     if (0) /* Crash on Windows */
+@@ -585,7 +578,6 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsMethodPresentWithArity(statics, str, str2, 1, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsMethodPresentWithArity failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE, "IsMethodPresentWithArity returned FALSE.\n");
+@@ -605,9 +597,7 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsEventPresent(statics, str, NULL, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsEventPresent failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsEventPresent returned FALSE.\n");
+ 
+     if (0) /* Crash on Windows */
+@@ -618,7 +608,6 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsEventPresent(statics, str, str2, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsEventPresent failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE, "IsEventPresent returned FALSE.\n");
+@@ -638,9 +627,7 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsPropertyPresent(statics, str, NULL, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsPropertyPresent failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsPropertyPresent returned TRUE.\n");
+ 
+     if (0) /* Crash on Windows */
+@@ -651,7 +638,6 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsPropertyPresent(statics, str, str2, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsPropertyPresent failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE, "IsPropertyPresent returned FALSE.\n");
+@@ -671,9 +657,7 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsReadOnlyPropertyPresent(statics, str, NULL, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsReadOnlyPropertyPresent failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsReadOnlyPropertyPresent returned TRUE.\n");
+ 
+     if (0) /* Crash on Windows */
+@@ -684,9 +668,7 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsReadOnlyPropertyPresent(statics, str, str2, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsReadOnlyPropertyPresent failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsReadOnlyPropertyPresent returned TRUE.\n");
+ 
+     WindowsDeleteString(str2);
+@@ -704,9 +686,7 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsWriteablePropertyPresent(statics, str, NULL, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsWriteablePropertyPresent failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsWriteablePropertyPresent returned TRUE.\n");
+ 
+     if (0) /* Crash on Windows */
+@@ -717,7 +697,6 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsWriteablePropertyPresent(statics, str, str2, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsWriteablePropertyPresent failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE || broken(ret == FALSE) /* Win10 1507 */,
+@@ -738,9 +717,7 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsEnumNamedValuePresent(statics, str, NULL, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsEnumNamedValuePresent failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsEnumNamedValuePresent returned TRUE.\n");
+ 
+     if (0) /* Crash on Windows */
+@@ -751,16 +728,13 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsEnumNamedValuePresent(statics, str, str2, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsEnumNamedValuePresent failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE, "IsEnumNamedValuePresent returned FALSE.\n");
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsEnumNamedValuePresent(statics, str, str, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsEnumNamedValuePresent failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsEnumNamedValuePresent returned TRUE.\n");
+ 
+     WindowsDeleteString(str2);
+@@ -815,21 +789,18 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsApiContractPresentByMajorAndMinor(statics, str, 1, 0, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsApiContractPresentByMajorAndMinor failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE, "IsApiContractPresentByMajorAndMinor returned FALSE.\n");
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsApiContractPresentByMajorAndMinor(statics, str, 0, 999, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsApiContractPresentByMajorAndMinor failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE, "IsApiContractPresentByMajorAndMinor returned FALSE.\n");
+ 
+     ret = FALSE;
+     hr = IApiInformationStatics_IsApiContractPresentByMajorAndMinor(statics, str, 1, 999, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsApiContractPresentByMajorAndMinor failed, hr %#lx.\n", hr);
+     todo_wine
+     ok(ret == TRUE || broken(ret == FALSE) /* Win10 1507 */,
+@@ -837,9 +808,7 @@ static void test_IApiInformationStatics(void)
+ 
+     ret = TRUE;
+     hr = IApiInformationStatics_IsApiContractPresentByMajorAndMinor(statics, str, 999, 999, &ret);
+-    todo_wine
+     ok(hr == S_OK, "IsApiContractPresentByMajorAndMinor failed, hr %#lx.\n", hr);
+-    todo_wine
+     ok(ret == FALSE, "IsApiContractPresentByMajorAndMinor returned TRUE.\n");
+ 
+     WindowsDeleteString(str);

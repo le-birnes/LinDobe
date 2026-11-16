@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.3 - 2026-11-16
+
+- **Lightroom (desktop, not Classic) starts normally.** Every start showed "(unknown C++ exception)", then "can only init the Organize Module once", and the window stayed blank with raw command names in the menus. Lightroom asks Windows whether an optional feature (haptics) exists; Wine answered "not implemented" instead of yes or no, and Lightroom treated that as fatal. Patch 0180 makes these questions answer. Found and traced in #56, thank you. Test: tests/winrt/apiinfo.c.
+
 ## 0.6.2 - 2026-11-14
 
 - **After Effects offers Advanced 3D on Intel and AMD graphics.** It said "Advanced 3D is not supported by the current hardware" and kept Classic 3D, because Wine's OpenCL could not share Direct3D 11 resources, which After Effects needs when it has no CUDA. Patches 0178 and 0179, from the Neutron project (thank you), replace our 0127. Checked on an Intel Iris Xe: Advanced 3D is accepted and draws in the viewer and in rendered frames; Premiere is unchanged. NVIDIA is unaffected.
