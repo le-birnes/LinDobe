@@ -219,3 +219,7 @@ All other 84 patches are byte-identical copies of wine/patches (some apply at a 
   replacing 0127. After Effects on Intel and AMD graphics gets Advanced 3D: on an Intel Iris Xe it no longer says
   "Advanced 3D is not supported by the current hardware", and the Advanced 3D renderer draws in the viewer and in
   rendered frames. Premiere's GPU check and test suite are unchanged (7/7). NVIDIA is unaffected (After Effects uses CUDA there).
+- 0180 (2026-11-16): wintypes: ApiInformation's Is*Present queries answer instead of returning E_NOTIMPL. Lightroom
+  (desktop, not Classic) threw "(unknown C++ exception)" and "can only init the Organize Module once" at every start
+  (#56, traced by the reporter). Checked with Lightroom 10.0: both dialogs gone, library and Local tab work;
+  tests/winrt/apiinfo.c passes; Wine's own wintypes tests have 0 failures.

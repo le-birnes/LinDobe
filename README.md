@@ -16,7 +16,7 @@ AI was used as a tool to build it, and we say so plainly: see [Why this exists](
 **See it in action:** [a short showreel (1:24)](https://youtu.be/3Vbzt4cGSQQ), made entirely in these apps on
 Linux, from the painting to the final export.
 
-> **Still early (0.6.2).** LinDobe is built and tested day to day on one Arch-based laptop (CachyOS, NVIDIA RTX
+> **Still early (0.6.3).** LinDobe is built and tested day to day on one Arch-based laptop (CachyOS, NVIDIA RTX
 > 4070). The installer also runs on Fedora, Ubuntu, Debian, Linux Mint, openSUSE and others, but those have had less
 > real-world use. If you try it, please tell us how it went, good or bad: it really helps.
 
