@@ -30,40 +30,41 @@ Beyond the per-app checklists, five gates apply to all apps:
 Apps in scope: Creative Cloud desktop, Photoshop (with Camera Raw), Illustrator, Premiere
 Pro, Media Encoder, Audition, After Effects, InDesign, Bridge.
 
-## Where we are (November 2026)
+## Where we are (2026-11-19, LinDobe 0.6.3)
 
 | App | Core functions | Full checklist (tested / known) | Notes |
 |---|---|---|---|
 | Creative Cloud | 10/10 | 10 / 248 | close button doesn't quit; hang after a self-update |
-| Photoshop | 10/10 | **85 / 661** | all 75 filters and adjustments run so far match Windows (60 pixel-identical, the random ones at the same noise level). Web Home panel blank |
+| Photoshop | 10/10 | **85 / 676** | all 75 filters and adjustments run so far match Windows (60 pixel-identical, the random ones at the same noise level). Web Home panel blank |
 | Illustrator | 11/11 | 118 / 1730 | 107 of 139 Windows reference outputs match, the rest not compared yet; memory use on 16 GB machines (#2) |
-| Premiere Pro | 10/10 | 10 / 368 | Import/Export modes draw (patch 0082); HEVC export passes the speed gate (5-10% faster than Windows after correction) |
-| Media Encoder | 10/10 | 10 / 547 | |
+| Premiere Pro | 10/10 | 10 / 797 | Import/Export modes draw (patch 0082); HEVC export passes the speed gate (5-10% faster than Windows after correction) |
+| Media Encoder | 10/10 | 10 / 607 | |
 | Audition | 10/10 | 10 / 498 | |
-| After Effects | partial | being inventoried | renders since 0.2.2 (Render Queue crash fixed, patch 0061); a real 300-layer comp matches the Windows render. Scripting, keyframes, panels work |
-| InDesign | not scored yet | | lays out and exports: styles, tables, placed PSD/AI files, PDF and PNG (used in the [showreel](https://youtu.be/3Vbzt4cGSQQ)) |
+| After Effects | partial | 33 / 985 | renders since 0.2.2 (Render Queue crash fixed, patch 0061); a real 300-layer comp matches the Windows render. Scripting, keyframes, panels work |
+| InDesign | not scored yet | 34 / 3128 | lays out and exports: styles, tables, placed PSD/AI files, PDF and PNG (used in the [showreel](https://youtu.be/3Vbzt4cGSQQ)) |
 | Bridge | opens | 27 / 149 | 26 of the most-used functions pass |
 | Lightroom Classic | | | 21 of the most-used functions pass |
-| Lightroom | | | 12 functions pass by hand |
+| Lightroom | | | 12 functions pass by hand; start-up exception fixed in 0.6.3 (patch 0180, #56) |
 | Acrobat | | | 22 of the most-used functions pass |
 
-The full checklists come from the Windows inventories (menus, filters, effects, presets...): 3213
-known functions so far, 163 tested (5%). That is the real starting line, and most of what is
+The full checklists come from the Windows inventories (menus, filters, effects, presets...): all 9
+apps are inventoried, 8818 known functions, 337 tested and passing (3.8%, 2026-11-19). That is the real starting line, and most of what is
 untested has simply not been run yet, not found broken.
 
 "Core functions" are the 10-11 everyday functions per app in [STATUS.md](STATUS.md). They
 say an app is usable, not that all of it is: the full checklists answer that.
 
 Tested hardware so far: NVIDIA RTX 4070 Laptop (reference), and community reports on
-RTX 4060, RTX 4090 and Intel UHD 620 (see [COMPATIBILITY.md](COMPATIBILITY.md)). **No AMD
-report yet.**
+RTX 4060, RTX 4090, Intel UHD 620 and AMD RX 7900 XTX (#15), and Intel Iris Xe tested here: Photoshop
+and Premiere's GPU renderer pass on it (see [COMPATIBILITY.md](COMPATIBILITY.md)). AMD still needs more
+reports, and hardware video encoding (AMF) through Wine is missing.
 
 ## Milestones
 
 | | Gate | State |
 |---|---|---|
 | M1 | 0.2.0 released, Wine's own tests green again for our patches | done (the last two regressions, 0035 and 0039, fixed in 0.2.1) |
-| M2 | Full checklists for all 9 apps, so each has a real score | 7 of 9 (After Effects and InDesign to come) |
+| M2 | Full checklists for all 9 apps, so each has a real score | done (all 9 inventoried; running them is the work now) |
 | M3 | Every app at 90% or more; no open serious bug | |
 | M4 | Every app at 99% or more; speed and stability gates pass on NVIDIA | |
 | M5 | 100%: all apps, all gates, including one AMD and one Intel machine | |
@@ -73,6 +74,11 @@ Dates after M2 depend on what the checklists show.
 ## What's being worked on
 
 **Now**
+- **Running the full checklists** (Phase 1): 337 of 8818 functions are tested so far. Audition and Media Encoder
+  first, compared file by file with the Windows reference outputs.
+- **Neutron's compatibility work, with credit** (LGPL-2.1, credited per patch in [PATCHES.md](PATCHES.md)): Intel GPUs in Premiere and
+  After Effects' Advanced 3D on Intel/AMD (patches 0178-0179), plus 0150-0177 (Acrobat, Photoshop, Bridge). Next from
+  that list: AMD hardware encoding (needs an AMD tester) and a real-tablet pen test.
 - **One file for every distribution** (from 2026-10-24): `CCINSTALLER.flatpak` installs with a double-click on
   Fedora, Mint, Ubuntu, Debian, openSUSE, Arch and the rest, sets everything up and stops at Adobe's sign-in. No
   terminal and no Wine build. Next: updates through the software center, then Flathub.
@@ -110,7 +116,7 @@ Dates after M2 depend on what the checklists show.
 
 **Always**
 - Re-run the checklists after each Adobe update; a drop counts as a serious bug.
-- Move to each new Wine release when the tests are green on it (11.19 already applies).
+- Move to each new Wine release when the tests are green on it (LinDobe runs on 11.20; 11.22 is out).
 
 ## How you can help
 
